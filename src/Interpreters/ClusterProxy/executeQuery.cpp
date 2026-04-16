@@ -30,6 +30,7 @@
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/buildQueryTreeForShard.h>
+#include <Storages/buildQueryTreeDistributedForShuffle.h>
 #include <Storages/getStructureOfRemoteTable.h>
 
 
@@ -73,7 +74,10 @@ namespace Setting
     extern const SettingsBool async_socket_for_remote;
     extern const SettingsBool async_query_sending_for_remote;
     extern const SettingsString cluster_for_parallel_replicas;
+    extern const SettingsBool distributed_shuffle_join;
+    extern const SettingsBool distributed_shuffle_join_internal;
     extern const SettingsBool parallel_replicas_support_projection;
+    extern const SettingsBool prefer_global_in_and_join;
 }
 
 namespace DistributedSetting
@@ -368,6 +372,18 @@ void executeQuery(
     new_context->increaseDistributedDepth();
 
     const size_t shards = cluster->getShardCount();
+    const bool use_distributed_shuffle_join
+        = settings[Setting::distributed_shuffle_join]
+        && !settings[Setting::distributed_shuffle_join_internal]
+        && settings[Setting::allow_experimental_analyzer]
+        && shouldRewriteDistributedShuffleJoinQuery(query_info.query_tree, context);
+
+    if (use_distributed_shuffle_join)
+    {
+        new_context->setSetting("distributed_shuffle_join_internal", Field{true});
+        new_context->setSetting("distributed_product_mode", String{"allow"});
+        new_context->setSetting("prefer_global_in_and_join", Field{false});
+    }
 
     if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
@@ -375,6 +391,7 @@ void executeQuery(
         {
             const auto & shard_info = cluster->getShardsInfo()[i];
 
+            // 当前 shard 的 query tree 先被 clone 出来：
             auto query_for_shard = query_info.query_tree->clone();
             if (sharding_key_expr && query_info.optimized_cluster && settings[Setting::optimize_skip_unused_shards_rewrite_in] && shards > 1 &&
                 /// TODO: support composite sharding key
@@ -388,6 +405,11 @@ void executeQuery(
                 };
                 optimizeShardingKeyRewriteIn(query_for_shard, std::move(visitor_data), new_context);
             }
+
+            // rewriteDistributedShuffleJoinQueryForShard(query_for_shard, i, shards, new_context)
+            // 这个函数会直接修改 query_for_shard，把它从原始 query 改成当前 shard 专属的 bucket query。
+            if (use_distributed_shuffle_join && !rewriteDistributedShuffleJoinQueryForShard(query_for_shard, i, shards, new_context))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected to rewrite distributed `shuffle join` query for shard {}", i + 1);
 
             // decide for each shard if parallel reading from replicas should be enabled
             // according to settings and number of replicas declared per shard

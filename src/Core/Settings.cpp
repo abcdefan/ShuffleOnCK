@@ -1969,6 +1969,15 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
+    DECLARE(Bool, distributed_shuffle_join, false, R"(
+Enable experimental execution of eligible distributed `JOIN` queries using per-shard bucketed subqueries that simulate `shuffle join` semantics.
+
+This setting is intended only for development and testing of the distributed `shuffle join` rewrite path.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, distributed_shuffle_join_internal, false, R"(
+This is internal setting that should not be used directly and represents an implementation detail of the distributed `shuffle join` mode.
+This setting is automatically set up by the initiator server for per-shard internal queries to prevent recursive rewrite on worker nodes.
+)", EXPERIMENTAL) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.

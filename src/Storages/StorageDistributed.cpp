@@ -89,6 +89,7 @@
 #include <TableFunctions/TableFunctionFactory.h>
 
 #include <Storages/buildQueryTreeForShard.h>
+#include <Storages/buildQueryTreeDistributedForShuffle.h>
 #include <Storages/IStorageCluster.h>
 
 #include <Processors/Executors/PushingPipelineExecutor.h>
@@ -161,6 +162,8 @@ namespace Setting
     extern const SettingsBool distributed_background_insert_split_batch_on_failure;
     extern const SettingsUInt64 distributed_group_by_no_merge;
     extern const SettingsBool distributed_foreground_insert;
+    extern const SettingsBool distributed_shuffle_join;
+    extern const SettingsBool distributed_shuffle_join_internal;
     extern const SettingsUInt64 distributed_push_down_limit;
     extern const SettingsBool extremes;
     extern const SettingsUInt64 force_optimize_skip_unused_shards;
@@ -971,21 +974,51 @@ void StorageDistributed::read(
 
     if (settings[Setting::allow_experimental_analyzer])
     {
-        StorageID remote_storage_id = StorageID{remote_database, remote_table};
+        const bool use_distributed_shuffle_join
+            = settings[Setting::distributed_shuffle_join]
+            && !settings[Setting::distributed_shuffle_join_internal]
+            && shouldRewriteDistributedShuffleJoinQuery(query_info.query_tree, local_context);
 
-        auto query_tree_distributed = buildQueryTreeDistributed(modified_query_info,
-            query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
-            remote_storage_id,
-            remote_table_function_ptr);
-        Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
+        QueryTreeNodePtr query_tree_distributed;
+
+        // 新增路径：保留原始query，在execute中修改每个shard的query
+        if (use_distributed_shuffle_join)
+        {
+            // 保留原始query tree
+            query_tree_distributed = query_info.query_tree->clone();
+
+            // 将优化后的shard集合设置为空，后续就会拿完整的cluster
+            // bucket 编号绑定的是完整 shard index，如果只剩优化后的 shard 子集，编号会变掉
+            modified_query_info.optimized_cluster = {};
+        }
+        // 原先路径：先做左表替换
+        else
+        {
+            StorageID remote_storage_id = StorageID{remote_database, remote_table};
+
+            query_tree_distributed = buildQueryTreeDistributed(modified_query_info,
+                query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
+                remote_storage_id,
+                remote_table_function_ptr);
+        }
+
+        QueryTreeNodePtr query_tree_for_header = query_tree_distributed;
+        if (use_distributed_shuffle_join && !modified_query_info.getCluster()->getShardsInfo().empty())
+        {
+            query_tree_for_header = query_tree_distributed->clone();
+
+            const size_t shard_count = modified_query_info.getCluster()->getShardCount();
+            if (!rewriteDistributedShuffleJoinQueryForShard(query_tree_for_header, 0, shard_count, local_context))
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected to rewrite distributed `shuffle join` query for sample block");
+        }
+
+        Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_for_header, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
           */
         for (auto & column : block)
             column.column = column.column->convertToFullColumnIfConst();
         header = std::make_shared<const Block>(std::move(block));
-
-        modified_query_info.query = queryNodeToDistributedSelectQuery(query_tree_distributed);
 
         modified_query_info.query_tree = std::move(query_tree_distributed);
 
