@@ -1,69 +1,40 @@
+import json
 import os
-import statistics
-import time
 
 import pytest
 
 from helpers.cluster import ClickHouseCluster
 
 
-# 起 6 个 ClickHouse 实例，模拟一个 3-shard、每个 shard 2-replica 的分布式集群。
+# 起 3 个 ClickHouse 实例，模拟一个 3-shard、每个 shard 1-replica 的分布式集群。
 cluster = ClickHouseCluster(__file__)
 
 node1 = cluster.add_instance(
     "node1",
     main_configs=["configs/remote_servers.xml"],
-    with_zookeeper=True,
-    macros={"shard": 1, "replica": 1},
+    macros={"shard": 1},
 )
 node2 = cluster.add_instance(
     "node2",
     main_configs=["configs/remote_servers.xml"],
-    with_zookeeper=True,
-    macros={"shard": 1, "replica": 2},
+    macros={"shard": 2},
 )
 node3 = cluster.add_instance(
     "node3",
     main_configs=["configs/remote_servers.xml"],
-    with_zookeeper=True,
-    macros={"shard": 2, "replica": 1},
-)
-node4 = cluster.add_instance(
-    "node4",
-    main_configs=["configs/remote_servers.xml"],
-    with_zookeeper=True,
-    macros={"shard": 2, "replica": 2},
-)
-node5 = cluster.add_instance(
-    "node5",
-    main_configs=["configs/remote_servers.xml"],
-    with_zookeeper=True,
-    macros={"shard": 3, "replica": 1},
-)
-node6 = cluster.add_instance(
-    "node6",
-    main_configs=["configs/remote_servers.xml"],
-    with_zookeeper=True,
-    macros={"shard": 3, "replica": 2},
+    macros={"shard": 3},
 )
 
 NODES = {
     "node1": node1,
     "node2": node2,
     "node3": node3,
-    "node4": node4,
-    "node5": node5,
-    "node6": node6,
 }
 
-SHARD_REPLICAS = {
-    1: (node1, node2),
-    2: (node3, node4),
-    3: (node5, node6),
-}
-
-PRIMARY_REPLICA_BY_SHARD = {
-    shard: replicas[0] for shard, replicas in SHARD_REPLICAS.items()
+SHARD_NODES = {
+    1: node1,
+    2: node2,
+    3: node3,
 }
 
 MATCHED_IDS = list(range(1, 16))
@@ -136,7 +107,7 @@ def format_sql_value(value):
 
 
 def insert_rows(node, table_name, rows):
-    # 直接往指定 replica 的本地表插数据，明确控制这些行属于哪个逻辑 shard。
+    # 直接往指定 shard 的本地表插数据，明确控制这些行属于哪个逻辑 shard。
     values = ", ".join(
         "(" + ", ".join(format_sql_value(value) for value in row) + ")"
         for row in rows
@@ -144,21 +115,21 @@ def insert_rows(node, table_name, rows):
     node.query(f"INSERT INTO default.{table_name} VALUES {values}")
 
 
-def create_replicated_local_table(table_name, columns, shard, replica_name):
+def create_local_table(table_name, columns):
     columns_sql = ",\n            ".join(columns)
     return f"""
         CREATE TABLE default.{table_name}
         (
             {columns_sql}
         )
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/test_distributed_shuffle_join/shard_{shard}/{table_name}', '{replica_name}')
+        ENGINE = MergeTree()
         ORDER BY id
     """
 
 
 def create_tables():
     # 每个节点都建本地表和 `Distributed` 表。
-    # 本地表使用 `ReplicatedMergeTree`，这样每个 shard 的两个 replica 持有同一份数据。
+    # 本地表使用 `MergeTree`，每个 shard 只有一个副本。
     a_columns = [
         "id UInt64",
         "a_val String",
@@ -193,10 +164,9 @@ def create_tables():
         node.query("DROP TABLE IF EXISTS default.a_local SYNC")
         node.query("DROP TABLE IF EXISTS default.b_local SYNC")
 
-    for shard, replicas in SHARD_REPLICAS.items():
-        for node in replicas:
-            node.query(create_replicated_local_table("a_local", a_columns, shard, node.name))
-            node.query(create_replicated_local_table("b_local", b_columns, shard, node.name))
+    for node in SHARD_NODES.values():
+        node.query(create_local_table("a_local", a_columns))
+        node.query(create_local_table("b_local", b_columns))
 
     for node in NODES.values():
         node.query(ddl_a_dist)
@@ -204,19 +174,17 @@ def create_tables():
 
 
 def sync_replicas():
-    for node in NODES.values():
-        node.query("SYSTEM SYNC REPLICA default.a_local")
-        node.query("SYSTEM SYNC REPLICA default.b_local")
+    return None
 
 
 def insert_data():
-    # 左右表只先写每个 shard 的一个主 replica，再同步到另一个 replica。
-    # 这样既能覆盖多副本场景，也能保持“数据并不是预先按 bucket 存到目标执行 shard 上”的性质。
+    # 左右表只写到每个 shard 的唯一副本上。
+    # 这样依然保持“数据并不是预先按 bucket 存到目标执行 shard 上”的性质。
     for shard, row_ids in LEFT_IDS_BY_SHARD.items():
-        insert_rows(PRIMARY_REPLICA_BY_SHARD[shard], "a_local", [build_left_row(row_id) for row_id in row_ids])
+        insert_rows(SHARD_NODES[shard], "a_local", [build_left_row(row_id) for row_id in row_ids])
 
     for shard, row_ids in RIGHT_IDS_BY_SHARD.items():
-        insert_rows(PRIMARY_REPLICA_BY_SHARD[shard], "b_local", [build_right_row(row_id) for row_id in row_ids])
+        insert_rows(SHARD_NODES[shard], "b_local", [build_right_row(row_id) for row_id in row_ids])
 
     sync_replicas()
 
@@ -301,11 +269,9 @@ def build_expected_rows_by_bucket_shard():
     return result
 
 
-def build_join_query(*, join_keyword, settings_clause):
-    # 统一生成测试 SQL。
-    # `join_keyword` 用来切换普通 `JOIN` 和 `GLOBAL JOIN`；
-    # `settings_clause` 用来切换默认、`allow`、`distributed_shuffle_join` 等模式。
-    return f"""
+def build_shuffle_join_query():
+    # 统一生成当前测试唯一关注的 `shuffle join` SQL。
+    return """
         SELECT
             a.id,
             a.a_val,
@@ -315,49 +281,89 @@ def build_join_query(*, join_keyword, settings_clause):
             b.b_group,
             b.b_metric
         FROM default.a_dist AS a
-        {join_keyword} default.b_dist AS b USING (id)
+        JOIN default.b_dist AS b USING (id)
         ORDER BY id
-        SETTINGS {settings_clause}
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
     """
 
 
-def measure_query_time(query, runs=3):
-    # 简单做 3 次 wall-clock 计时，用来做人工性能对比。
-    # 这里只做功能验证级别的对比，不作为严格性能结论。
-    result = None
-    durations = []
-
-    for _ in range(runs):
-        started_at = time.perf_counter()
-        result = node1.query(query)
-        durations.append(time.perf_counter() - started_at)
-
-    return result, durations
+def build_trace_query_id():
+    return f"distributed_shuffle_join_trace_{os.getpid()}"
 
 
-def execute_query_once_with_timing(query):
-    started_at = time.perf_counter()
-    result = node1.query(query)
-    duration = time.perf_counter() - started_at
-    return result, duration
+def flush_query_logs():
+    for node in NODES.values():
+        node.query("SYSTEM FLUSH LOGS")
 
 
-def test_default_double_distributed_join_is_denied(started_cluster):
-    # Case 1:
-    # 默认模式下，double-distributed `JOIN` 应该被拒绝。
-    reset_state()
-
-    query = build_join_query(
-        join_keyword="JOIN",
-        settings_clause="enable_analyzer = 1",
+def collect_query_log_rows(node, initial_query_id):
+    result = node.query(
+        f"""
+            SELECT
+                query_id,
+                initial_query_id,
+                is_initial_query,
+                read_rows,
+                result_rows,
+                query
+            FROM system.query_log
+            WHERE type = 'QueryFinish'
+              AND initial_query_id = '{initial_query_id}'
+            ORDER BY event_time_microseconds, query_id
+            FORMAT JSONEachRow
+        """
     )
 
-    with pytest.raises(Exception, match="Double-distributed IN/JOIN subqueries is denied"):
-        node1.query(query)
+    return [json.loads(line) for line in result.splitlines() if line.strip()]
+
+
+def collect_query_log_rows_by_node(initial_query_id):
+    return {
+        node_name: collect_query_log_rows(node, initial_query_id)
+        for node_name, node in NODES.items()
+    }
+
+
+def print_query_log_rows_by_node(rows_by_node):
+    print("Observed query_log rows by node:")
+
+    for node_name in sorted(rows_by_node):
+        print(f"[{node_name}]")
+
+        for row in rows_by_node[node_name]:
+            print(f"query_id={row['query_id']}")
+            print(f"initial_query_id={row['initial_query_id']}")
+            print(f"is_initial_query={row['is_initial_query']}")
+            print(f"read_rows={row['read_rows']}")
+            print(f"result_rows={row['result_rows']}")
+            print(f"query={row['query']}")
+            print()
+
+
+def collect_non_initial_query_rows(rows_by_node):
+    return [
+        row
+        for rows in rows_by_node.values()
+        for row in rows
+        if not row["is_initial_query"]
+    ]
+
+
+def collect_local_fetch_rows(rows_by_node):
+    local_table_markers = (
+        "FROM `default`.`a_local`",
+        "FROM `default`.`b_local`",
+    )
+
+    return [
+        row
+        for row in collect_non_initial_query_rows(rows_by_node)
+        if any(marker in row["query"] for marker in local_table_markers)
+    ]
 
 
 def test_shuffle_join_data_requires_subquery_fetch(started_cluster):
-    # Case 2:
+    # Case 1:
     # 测试数据没有预先放到 bucket 对应的目标执行 shard 上。
     # 如果 `shuffle join` 最终还能给出完整结果，就说明 internal query 的 distributed 子查询确实跨 shard 拉回了同 bucket 数据。
     assert count_prepositioned_rows(LEFT_IDS_BY_SHARD) == 0
@@ -365,90 +371,69 @@ def test_shuffle_join_data_requires_subquery_fetch(started_cluster):
 
 
 def test_distributed_shuffle_join_returns_expected_result(started_cluster):
-    # Case 3:
+    # Case 2:
     # 打开 `distributed_shuffle_join = 1` 后，应该能得到完整正确的 join 结果。
     reset_state()
 
-    query = build_join_query(
-        join_keyword="JOIN",
-        settings_clause="enable_analyzer = 1, distributed_shuffle_join = 1",
-    )
-
-    assert node1.query(query) == build_expected_result()
+    assert node1.query(build_shuffle_join_query()) == build_expected_result()
 
 
 @pytest.mark.skipif(
     os.environ.get("CLICKHOUSE_RUN_SHUFFLE_RUNTIME_COMPARISON") != "1",
-    reason="Set CLICKHOUSE_RUN_SHUFFLE_RUNTIME_COMPARISON=1 to run manual runtime comparison",
+    reason="Set CLICKHOUSE_RUN_SHUFFLE_RUNTIME_COMPARISON=1 to print manual shuffle trace",
 )
 def test_distributed_shuffle_join_runtime_comparison(started_cluster):
-    # Case 4:
-    # 手动性能对比：
-    # 1. `GLOBAL JOIN`
-    # 2. 普通 `allow`
-    # 3. `distributed_shuffle_join`
-    #
-    # 三种模式都先校验结果正确，再打印简单耗时，方便人工对比。
+    # Case 3:
+    # 手动 trace：
+    # 1. 只跑一次 `distributed_shuffle_join`
+    # 2. 用 `system.query_log` 打印各节点实际收到的 SQL
+    # 3. 用于人工核对 `shuffle` 内部查询是否按 bucket 下发
     reset_state()
 
-    global_query = build_join_query(
-        join_keyword="GLOBAL JOIN",
-        settings_clause="enable_analyzer = 1",
-    )
-
-    allow_query = build_join_query(
-        join_keyword="JOIN",
-        settings_clause="enable_analyzer = 1, distributed_product_mode = 'allow', prefer_global_in_and_join = 0",
-    )
-
-    shuffle_query = build_join_query(
-        join_keyword="JOIN",
-        settings_clause="enable_analyzer = 1, distributed_shuffle_join = 1",
-    )
-
+    shuffle_query = build_shuffle_join_query()
+    trace_query_id = build_trace_query_id()
     expected_result = build_expected_result()
     expected_rows_by_bucket_shard = build_expected_rows_by_bucket_shard()
 
-    # 先预热一次，避免第一次执行把建连接等一次性开销也算进去。
-    node1.query(global_query)
-    node1.query(allow_query)
-    node1.query(shuffle_query)
+    shuffle_result = node1.query(
+        shuffle_query,
+        query_id=trace_query_id,
+        settings={"log_queries": 1},
+    )
+    flush_query_logs()
+    rows_by_node = collect_query_log_rows_by_node(trace_query_id)
 
-    global_result, global_durations = measure_query_time(global_query)
-    allow_result, allow_durations = measure_query_time(allow_query)
-    shuffle_result, shuffle_durations = measure_query_time(shuffle_query)
-
-    assert global_result == expected_result
-    assert allow_result == expected_result
     assert shuffle_result == expected_result
+    assert any(
+        row["is_initial_query"] and "distributed_shuffle_join = 1" in row["query"]
+        for row in rows_by_node["node1"]
+    )
+    assert any(not row["is_initial_query"] for row in rows_by_node["node2"])
+    assert any(not row["is_initial_query"] for row in rows_by_node["node3"])
+
+    worker_rows = collect_non_initial_query_rows(rows_by_node)
+    local_fetch_rows = collect_local_fetch_rows(rows_by_node)
+
+    for bucket in range(SHARD_COUNT):
+        assert any(
+            "modulo(cityHash64" in row["query"] and f"_CAST({bucket}, 'UInt64')" in row["query"]
+            for row in worker_rows
+        )
+        assert any(
+            f"FROM `default`.`a_local`" in row["query"] and f"_CAST({bucket}, 'UInt64')" in row["query"]
+            for row in local_fetch_rows
+        )
+        assert any(
+            f"FROM `default`.`b_local`" in row["query"] and f"_CAST({bucket}, 'UInt64')" in row["query"]
+            for row in local_fetch_rows
+        )
+
+    assert local_fetch_rows
+    assert all("modulo(cityHash64" in row["query"] for row in local_fetch_rows)
 
     print("Expected rows by bucket shard:")
     for shard in sorted(expected_rows_by_bucket_shard):
-        print(f"[bucket shard {shard}]")
+        print(f"[bucket shard {shard} / modulo {shard - 1}]")
         print(expected_rows_by_bucket_shard[shard])
-
-    print(
-        "GLOBAL JOIN average: "
-        f"{statistics.mean(global_durations):.6f}s "
-        f"(runs={', '.join(f'{value:.6f}' for value in global_durations)})"
-    )
-    print(
-        "allow average: "
-        f"{statistics.mean(allow_durations):.6f}s "
-        f"(runs={', '.join(f'{value:.6f}' for value in allow_durations)})"
-    )
-    print(
-        "distributed_shuffle_join average: "
-        f"{statistics.mean(shuffle_durations):.6f}s "
-        f"(runs={', '.join(f'{value:.6f}' for value in shuffle_durations)})"
-    )
-
-    print("Actual query results and single-run timings:")
-    for label, query in [
-        ("GLOBAL JOIN", global_query),
-        ("allow", allow_query),
-        ("distributed_shuffle_join", shuffle_query),
-    ]:
-        result, duration = execute_query_once_with_timing(query)
-        print(f"[{label}] single run: {duration:.6f}s")
-        print(result)
+    print(f"Trace query_id: {trace_query_id}")
+    print_query_log_rows_by_node(rows_by_node)
