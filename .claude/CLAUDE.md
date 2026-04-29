@@ -162,3 +162,153 @@ ARM machines in CI are not slow. They are similar to x86 in performance.
 
 Use `tmp` subdirectory in the current directory for temporary files (logs, downloads, scripts, etc.), do not use `/tmp`. Create the directory if needed.
 
+## Distributed shuffle join development notes
+
+This section records the current plan for implementing real distributed `shuffle join`. It is intentionally written in Chinese because the design discussion for this branch is in Chinese.
+
+### 背景结论
+
+当前已弃用早期 `shuffle` 分支里的 SQL 改写方案。那个方案把原始 `JOIN` 改写成每个 shard 一条带 bucket 过滤的 `Distributed` 子查询，例如左右两边都加 `cityHash64(join_key) % shard_count = bucket`。这种方式只能从形式上得到按 bucket 执行的结果，但本质上仍然是嵌套分布式读，会导致每个 bucket 重复扫描源表，不是真正的数据重分布。
+
+新的 `exchange` 分支应从 `master` 重新开发，不复用早期 `buildQueryTreeDistributedForShuffle` 这类 SQL rewrite 代码。可以参考旧分支中的测试思想，但不要把旧分支作为实现基础。
+
+`GLOBAL JOIN` 的代码分析给我们的主要启发是：
+
+- `GLOBAL JOIN` 会先在发起节点执行右侧子查询，把结果写入 query context 中的临时表，例如 `_data_<hash>`。
+- 这个临时表通过 external table 机制随远端 query 一起发送到各 shard。
+- 远端 query 在执行前通过 `TCPHandler` 初始化 external tables，然后在本地 `JOIN` 中读取 `StorageMemory`。
+- `GLOBAL JOIN` 的临时表生命周期天然绑定到单个远端 query context，query 结束后释放。
+
+真正的 `shuffle join` 和 `GLOBAL JOIN` 的区别是：`GLOBAL JOIN` 是 initiator 单生产者广播一份右表临时表；`shuffle join` 是所有 source shard 同时作为生产者，把左右两侧数据按 `JOIN` key 拆分后发送到不同 target shard。target shard 上的临时表会被多个 source shard 追加写入，并且 final `JOIN` 必须等待所有 source shard 发送完成。因此 `shuffle join` 需要显式的 `exchange` 生命周期、barrier、异常传播和清理逻辑。
+
+### MVP 支持范围
+
+第一版只做一个窄范围 MVP，用来证明执行模型是真正的 `shuffle exchange`，不要一开始追求完整产品化。
+
+MVP 暂定只支持：
+
+- `enable_analyzer = 1`。
+- `INNER ALL JOIN`。
+- 单个等值 `JOIN` key，例如 `USING (id)` 或简单 `ON a.id = b.id`。
+- 左右两边都是直接的 `StorageDistributed` 表。
+- 左右两边属于同一个 `cluster`。
+- 每个 shard 只使用一个 replica，暂时不支持 parallel replicas。
+- 临时数据先使用内存中的 `StorageMemory`，数据超限可以先报错。
+- 暂时不支持 spill、复杂子查询、多 key、多种 `JOIN` strictness、`LEFT` / `RIGHT` / `FULL` / `ASOF` / `SEMI` / `ANTI` 等复杂语义。
+
+MVP 的正确执行形态应该是：
+
+```text
+source shard:
+  read local left table once
+  read local right table once
+  split each block by JOIN key
+  send each bucket to corresponding target shard
+
+target shard:
+  receive left buckets from all source shards
+  receive right buckets from all source shards
+  wait until both sides are complete
+  run local JOIN over two temporary tables
+  return result to initiator
+
+initiator:
+  coordinate exchange
+  collect target shard JOIN results
+  union final result
+```
+
+第一版必须能证明每个 source shard 对每侧输入只扫描一次，不能退化成按 bucket 重复扫描。
+
+### 当前代码改动步骤
+
+建议按下面顺序推进，避免过早把复杂逻辑塞进 `StorageDistributed::read`。
+
+1. 增加实验 setting
+
+   新增 `distributed_shuffle_join`，默认关闭。必要时增加内部 setting，例如 `distributed_shuffle_join_internal`，用于防止 worker 上递归触发 shuffle rewrite。setting 文档要明确这是实验功能。
+
+2. 增加 eligibility analyzer
+
+   新增独立 helper，负责判断一条 query 是否可以进入 MVP `shuffle join` 路径。它应只做资格判断和提取信息，不做执行：
+
+   - 左右 table expression。
+   - 左右 `StorageDistributed`。
+   - `JOIN` kind、strictness、locality。
+   - 左右 `JOIN` key 表达式。
+   - cluster 名称和 shard 数。
+   - 需要读取的左表列和右表列。
+
+3. 设计 `ShuffleExchange` registry
+
+   增加 query-scoped 或 server-scoped 的 exchange registry，用 `initial_query_id` 加 `join_id` 形成 `exchange_id`。target shard 上至少需要保存：
+
+   - `exchange_id`。
+   - left temporary table。
+   - right temporary table。
+   - expected source shard count。
+   - each side 的 finished producer count。
+   - cancellation flag。
+   - first exception。
+
+   这个 registry 是 MVP 的核心。不要只依赖普通 external table 生命周期，因为 external table 更适合 `GLOBAL JOIN` 的单连接、query 前置传输模型。
+
+4. 实现 receiver 侧临时表写入
+
+   target shard 收到 `exchange_id`、side、block 后，应找到对应 `ShuffleExchange`，把 block 追加写入 left 或 right 临时表。MVP 可以先用 `TemporaryTableHolder` 和 `StorageMemory`，但要明确并发写入是否安全；如果不安全，receiver 侧需要串行化写入。
+
+5. 实现 source 侧 `ShuffleExchangeSink`
+
+   source shard 读取本地表产生 block 后，由 `ShuffleExchangeSink` 按 `JOIN` key 计算目标 shard selector 并拆分 block。分片逻辑应参考或复用 `DistributedSink::createSelector`、`DistributedSink::splitBlock` 和 `StorageDistributed::createSelector`，不要手写固定的 `cityHash64(key) % shard_count` 作为最终方案。
+
+6. 增加 exchange 网络传输路径
+
+   需要明确 source shard 如何向 target shard 发送 shuffle block、finish、exception。MVP 可以先使用内部连接上的专用命令或较小范围的协议扩展，但不要把它伪装成普通 SQL rewrite。最终代码应让数据流是 block 级别的 exchange，而不是 SQL 层重复查询。
+
+7. 增加 barrier
+
+   target shard 的 final `JOIN` 必须等待所有 source shard 对 left side 和 right side 都发送 finished。任何 source 抛异常或 query 被取消时，所有 target shard 都应停止等待并清理临时数据。
+
+8. 接入 distributed query plan
+
+   当 eligibility analyzer 通过时，`StorageDistributed::read` 或相邻的 planner 入口应构建特殊的 shuffle execution path：
+
+   - initiator 创建 `exchange_id`。
+   - 在所有 source shard 启动 left producer 和 right producer。
+   - 在所有 target shard 启动 final local `JOIN` query。
+   - initiator union 所有 target shard 的结果。
+
+   这里应尽量把实现拆到独立类，例如 `DistributedShuffleJoinAnalyzer`、`ShuffleExchangeCoordinator`、`ShuffleExchangeSink`，不要把所有逻辑直接写进 `StorageDistributed::read` 或 `ClusterProxy::executeQuery`。
+
+9. 增加测试
+
+   先写 integration tests 覆盖：
+
+   - 左右表都故意不按 `JOIN` key 落位，结果仍然完整正确。
+   - 每个 source shard 每侧输入只扫描一次。
+   - target shard 能看到来自多个 source shard 的同一 side 数据。
+   - query 取消、异常、source shard 失败时，exchange 临时表能清理。
+   - `distributed_shuffle_join = 0` 时不改变现有执行路径。
+
+   跑 integration tests 时输出必须重定向到 build 目录日志文件，并让子 agent 分析日志摘要。
+
+### 未来产品化方向
+
+MVP 完成后，再逐步做产品化能力：
+
+- 支持 spill 到磁盘。`StorageMemory` 只能用于 MVP，大数据场景必须有内存上限和落盘策略，可以参考 `GraceHashJoin` 的 bucket 文件思路或 ClickHouse 现有 temporary data 组件。
+- 增加网络 backpressure、限流、压缩、block squashing，避免 all-to-all shuffle 在大集群中打满连接池和网络。
+- 支持失败传播和取消清理，包括 source 失败、target 失败、initiator 取消、超时、连接断开。
+- 支持 parallel replicas 和 replica 选择策略。
+- 支持更多 `JOIN` 类型、strictness、多 key、表达式 key、nullable key。
+- 增加 skew 观测和保护，例如每 bucket 行数、每 bucket 字节数、最大 bucket 限制和 fallback。
+- 增加 profile events 和 query log 字段，用于观察 shuffle rows、shuffle bytes、send time、receive time、barrier wait time、spill bytes。
+- 增加 cost model，在 `GLOBAL JOIN`、普通 distributed `JOIN`、`shuffle join` 之间自动选择。右表很小或过滤很强时，broadcast 可能比 shuffle 更合适。
+
+### 开发注意事项
+
+- 不要把当前 MVP 做成 SQL rewrite。真正目标是 block-level exchange。
+- 不要在第一版承诺大表稳定运行。MVP 可以在内存超限时报错。
+- 不要在 C++ 代码中用 sleep 修 race condition。
+- 所有文档、注释、commit message 中提到 ClickHouse SQL 名称、类名、函数名、日志原文时，用 inline code 包住，例如 `StorageDistributed`、`GLOBAL JOIN`、`createSelector`。
+- 新增 C++ 代码保持 Allman-style braces。

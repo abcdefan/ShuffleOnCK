@@ -1969,6 +1969,11 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
+    DECLARE(Bool, distributed_shuffle_join, false, R"(
+Enable experimental execution of eligible distributed `JOIN` queries using block-level shuffle exchange.
+
+This setting is intended only for development and testing of the distributed `shuffle join` execution path.
+)", EXPERIMENTAL) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.
