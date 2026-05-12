@@ -314,11 +314,18 @@ initiator:
   - `DistributedShuffleJoinBlockSender` 是发送抽象，定义 `sendBlock`、`finish`、`cancel`。
   - `LocalDistributedShuffleJoinBlockSender` 是本地 sender，用于先在单进程内打通 `sink -> receiver -> exchange`，不经过网络。
   - `DistributedShuffleJoinSink` 继承 `SinkToStorage`，接收 input chunk 后转成 `Block`，通过传入的 selector 计算每行目标 target shard，用 `IColumn::scatter` 分块，然后调用 sender 发送；`onFinish` 会向所有 target shard 发送 finish，`onCancel` 会传播 cancel。
+- `src/Storages/DistributedShuffleJoinSelector.h` 和 `src/Storages/DistributedShuffleJoinSelector.cpp`：新增 MVP 版 `JOIN` key selector builder。
+  - `createDistributedShuffleJoinSelector` 接收 `ClusterPtr` 和 key column name，返回 `DistributedShuffleJoinSelector`。
+  - 当前只支持 key 已经是 block 中的直接列，暂不支持复杂表达式 key。
+  - 内部复用 `createBlockSelector` 和 cluster 的 `slot_to_shard`，因此遵循 `Distributed` sharding 的 slot/weight 规则。
+  - 当前类型范围与 `StorageDistributed` 的整数 sharding key 路径对齐，支持整数类型和整数字典的 `LowCardinality`，暂不支持 `String`、`Nullable` 等 key。
 - `src/Storages/tests/gtest_distributed_shuffle_join.cpp`：新增本地闭环 gtest。该测试构造两个 source shard 和两个 target shard，用测试 selector `id % 2` 驱动 `DistributedShuffleJoinSink -> LocalDistributedShuffleJoinBlockSender -> DistributedShuffleJoinExchangeReceiver -> DistributedShuffleJoinExchange`，验证：
   - left/right 两侧都能按 target shard 正确分块。
   - 多个 source shard 能写入同一个 target exchange。
   - 每个 target exchange 在所有 source 对 left/right 都发送 finish 后变为 ready。
   - target exchange 中的 blocks、rows 统计符合预期。
+  - 当前测试已改为通过 `createDistributedShuffleJoinSelector` 构造 selector，不再直接在测试中硬编码 `% 2` 作为 sink 的 selector。
+  - 新增 `SelectorUsesJoinKeyColumn` 测试，验证 left/right block 只要 key value 相同，就会被 selector 分配到同一个 target shard。
 
 当前已经验证过的编译目标：
 
@@ -326,17 +333,19 @@ initiator:
 - `ninja -C build src/CMakeFiles/dbms.dir/Core/Settings.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinExchange.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSink.cpp.o`
+- `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSelector.cpp.o`
 - `ninja -C build src/CMakeFiles/unit_tests_dbms.dir/Storages/tests/gtest_distributed_shuffle_join.cpp.o`
 - `ninja -C build unit_tests_dbms`
 
 当前已经运行过的测试：
 
 - `build/src/unit_tests_dbms --gtest_filter=DistributedShuffleJoin.LocalSinkReceiverExchangeRoundTrip`
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'`
 
 当前代码还没有完成的部分：
 
 - `DistributedShuffleJoinExchangeRegistry` 还没有挂到 server-level 或 query-accessible 的 `Context` 中。
-- `DistributedShuffleJoinSink` 的 selector 目前是外部传入的 `std::function`，还没有接 `JOIN` key 表达式，也还没有复用 `StorageDistributed::createSelector`。
+- `DistributedShuffleJoinSink` 的 selector 目前仍由外部传入，但已经有 MVP 版 `createDistributedShuffleJoinSelector` 可根据直接 key 列构造 selector。复杂表达式 key 尚未接入。
 - 目前只有 `LocalDistributedShuffleJoinBlockSender`，还没有真正的 remote sender / receiver 网络传输路径。
 - exchange 中的临时数据当前是内存中的 `std::vector<Block>`，还没有包装成 final local `JOIN` 可直接读取的 `Source` 或 `StorageMemory`。
 - 尚未接入 `StorageDistributed::read`、`ClusterProxy::executeQuery` 或更合适的 planner 入口。
@@ -344,9 +353,9 @@ initiator:
 
 下一步建议：
 
-1. 实现真正的 `JOIN` key selector 构建逻辑，优先参考 `DistributedSink::createSelector`、`DistributedSink::splitBlock` 和 `StorageDistributed::createSelector`。
-2. 设计 remote sender / receiver 网络路径，让 source shard 能把 `sendBlock`、`finish`、`cancel` 发送到目标 target shard。
-3. 设计 final local `JOIN` 如何读取 exchange blocks，可以先评估包装成 `SourceFromChunks`，再决定是否切换到 `StorageMemory`。
+1. 设计 remote sender / receiver 网络路径，让 source shard 能把 `sendBlock`、`finish`、`cancel` 发送到目标 target shard。
+2. 设计 final local `JOIN` 如何读取 exchange blocks，可以先评估包装成 `SourceFromChunks`，再决定是否切换到 `StorageMemory`。
+3. 把 `DistributedShuffleJoinAnalyzer` 提取到的 left/right key column 接到 `createDistributedShuffleJoinSelector`，让左右 sink 使用各自的 key 列名构造 selector。
 4. 最后再接 distributed query plan，不要过早把未稳定的生命周期和网络逻辑塞进 `StorageDistributed::read`。
 
 ### 未来产品化方向

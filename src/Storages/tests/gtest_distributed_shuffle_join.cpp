@@ -1,9 +1,12 @@
 #include <Storages/DistributedShuffleJoinExchange.h>
+#include <Storages/DistributedShuffleJoinSelector.h>
 #include <Storages/DistributedShuffleJoinSink.h>
 
 #include <Columns/ColumnsNumber.h>
 #include <Core/Block.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Interpreters/Cluster.h>
 #include <Processors/Chunk.h>
 
 #include <gtest/gtest.h>
@@ -35,16 +38,35 @@ Chunk makeChunk(const std::vector<UInt64> & ids)
     return Chunk(block.getColumns(), block.rows());
 }
 
-IColumn::Selector selectByIdParity(const Block & block)
+ClusterPtr makeTwoShardCluster()
 {
-    const auto & id_column = typeid_cast<const ColumnUInt64 &>(*block.getByName("id").column);
-    const auto & ids = id_column.getData();
+    static const String username = "default";
+    static const String password;
+    static const String bind_host;
+    static const String cluster_name = "distributed_shuffle_join_test";
+    static const String cluster_secret;
 
-    IColumn::Selector selector(ids.size());
-    for (size_t i = 0; i < ids.size(); ++i)
-        selector[i] = ids[i] % 2;
+    Settings settings;
+    ClusterConnectionParameters params
+    {
+        .username = username,
+        .password = password,
+        .clickhouse_port = 9000,
+        .treat_local_as_remote = true,
+        .treat_local_port_as_remote = true,
+        .bind_host = bind_host,
+        .cluster_name = cluster_name,
+        .cluster_secret = cluster_secret,
+    };
 
-    return selector;
+    return std::make_shared<Cluster>(
+        settings,
+        std::vector<std::vector<String>>
+        {
+            {"127.0.0.1:9000"},
+            {"127.0.0.2:9000"},
+        },
+        params);
 }
 
 std::vector<UInt64> collectIds(const std::vector<Block> & blocks)
@@ -81,6 +103,7 @@ TEST(DistributedShuffleJoin, LocalSinkReceiverExchangeRoundTrip)
 
     auto sender = std::make_shared<LocalDistributedShuffleJoinBlockSender>(
         std::vector<DistributedShuffleJoinExchangeReceiver *>{&target0_receiver, &target1_receiver});
+    auto selector = createDistributedShuffleJoinSelector(makeTwoShardCluster(), "id");
 
     const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "local-shuffle-test", .join_id = 0};
     constexpr size_t source_shard_count = 2;
@@ -95,7 +118,7 @@ TEST(DistributedShuffleJoin, LocalSinkReceiverExchangeRoundTrip)
             source_shard_index,
             target_shard_count,
             side,
-            selectByIdParity,
+            selector,
             sender);
     };
 
@@ -130,6 +153,21 @@ TEST(DistributedShuffleJoin, LocalSinkReceiverExchangeRoundTrip)
     EXPECT_EQ(target0_left_stats.rows, 2);
     EXPECT_EQ(target1_right_stats.blocks, 2);
     EXPECT_EQ(target1_right_stats.rows, 2);
+}
+
+TEST(DistributedShuffleJoin, SelectorUsesJoinKeyColumn)
+{
+    auto selector = createDistributedShuffleJoinSelector(makeTwoShardCluster(), "id");
+
+    const auto left_selector = selector(makeBlock({1, 2, 7}));
+    const auto right_selector = selector(makeBlock({7, 1, 2}));
+
+    ASSERT_EQ(left_selector.size(), 3);
+    ASSERT_EQ(right_selector.size(), 3);
+
+    EXPECT_EQ(left_selector[0], right_selector[1]);
+    EXPECT_EQ(left_selector[1], right_selector[2]);
+    EXPECT_EQ(left_selector[2], right_selector[0]);
 }
 
 }
