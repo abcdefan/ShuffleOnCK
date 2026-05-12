@@ -4,7 +4,7 @@
 #include <Core/Block_fwd.h>
 #include <Columns/IColumn.h>
 #include <Processors/Sinks/SinkToStorage.h>
-#include <Storages/DistributedShuffleJoinExchange.h>
+#include <Storages/DistributedShuffleJoinTables.h>
 
 #include <functional>
 #include <memory>
@@ -24,49 +24,17 @@ public:
     virtual ~DistributedShuffleJoinBlockSender() = default;
 
     virtual void sendBlock(
-        const DistributedShuffleJoinExchangeId & id,
+        const DistributedShuffleJoinTableNames & table_names,
         size_t target_shard_index,
-        size_t source_shard_count,
         DistributedShuffleJoinTableSide side,
-        size_t source_shard_index,
         Block block) = 0;
 
     virtual void finish(
-        const DistributedShuffleJoinExchangeId & id,
+        const DistributedShuffleJoinTableNames & table_names,
         size_t target_shard_index,
-        size_t source_shard_count,
-        DistributedShuffleJoinTableSide side,
-        size_t source_shard_index) = 0;
+        DistributedShuffleJoinTableSide side) = 0;
 
-    virtual void cancel(const DistributedShuffleJoinExchangeId & id, String reason) noexcept = 0;
-};
-
-class LocalDistributedShuffleJoinBlockSender final : public DistributedShuffleJoinBlockSender
-{
-public:
-    explicit LocalDistributedShuffleJoinBlockSender(std::vector<DistributedShuffleJoinExchangeReceiver *> receivers_);
-
-    void sendBlock(
-        const DistributedShuffleJoinExchangeId & id,
-        size_t target_shard_index,
-        size_t source_shard_count,
-        DistributedShuffleJoinTableSide side,
-        size_t source_shard_index,
-        Block block) override;
-
-    void finish(
-        const DistributedShuffleJoinExchangeId & id,
-        size_t target_shard_index,
-        size_t source_shard_count,
-        DistributedShuffleJoinTableSide side,
-        size_t source_shard_index) override;
-
-    void cancel(const DistributedShuffleJoinExchangeId & id, String reason) noexcept override;
-
-private:
-    DistributedShuffleJoinExchangeReceiver & getReceiver(size_t target_shard_index) const;
-
-    std::vector<DistributedShuffleJoinExchangeReceiver *> receivers;
+    virtual void cancel(const DistributedShuffleJoinTableNames & table_names, String reason) noexcept = 0;
 };
 
 class DistributedShuffleJoinSink final : public SinkToStorage
@@ -74,9 +42,7 @@ class DistributedShuffleJoinSink final : public SinkToStorage
 public:
     DistributedShuffleJoinSink(
         SharedHeader header,
-        DistributedShuffleJoinExchangeId exchange_id_,
-        size_t source_shard_count_,
-        size_t source_shard_index_,
+        DistributedShuffleJoinTableNames table_names_,
         size_t target_shard_count_,
         DistributedShuffleJoinTableSide side_,
         DistributedShuffleJoinSelector selector_,
@@ -94,9 +60,7 @@ private:
     void checkSelector(const IColumn::Selector & selector, size_t rows) const;
     void finishAllTargets();
 
-    const DistributedShuffleJoinExchangeId exchange_id;
-    const size_t source_shard_count;
-    const size_t source_shard_index;
+    const DistributedShuffleJoinTableNames table_names;
     const size_t target_shard_count;
     const DistributedShuffleJoinTableSide side;
     const DistributedShuffleJoinSelector selector;

@@ -1974,6 +1974,11 @@ Enable experimental execution of eligible distributed `JOIN` queries using block
 
 This setting is intended only for development and testing of the distributed `shuffle join` execution path.
 )", EXPERIMENTAL) \
+    DECLARE(UInt64, shuffle_exchange_timeout_ms, 300000, R"(
+Timeout in milliseconds for the experimental distributed `shuffle join` exchange phase.
+
+The setting is intended only for development and testing while the distributed `shuffle join` coordinator is being implemented.
+)", EXPERIMENTAL) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.

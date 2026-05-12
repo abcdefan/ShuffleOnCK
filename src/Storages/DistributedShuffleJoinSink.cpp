@@ -13,100 +13,20 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-LocalDistributedShuffleJoinBlockSender::LocalDistributedShuffleJoinBlockSender(
-    std::vector<DistributedShuffleJoinExchangeReceiver *> receivers_)
-    : receivers(std::move(receivers_))
-{
-    if (receivers.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` local sender must have at least one receiver");
-
-    for (size_t i = 0; i < receivers.size(); ++i)
-    {
-        if (!receivers[i])
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` local sender receiver {} is null", i);
-    }
-}
-
-void LocalDistributedShuffleJoinBlockSender::sendBlock(
-    const DistributedShuffleJoinExchangeId & id,
-    size_t target_shard_index,
-    size_t source_shard_count,
-    DistributedShuffleJoinTableSide side,
-    size_t source_shard_index,
-    Block block)
-{
-    getReceiver(target_shard_index).receiveBlock(id, source_shard_count, side, source_shard_index, std::move(block));
-}
-
-void LocalDistributedShuffleJoinBlockSender::finish(
-    const DistributedShuffleJoinExchangeId & id,
-    size_t target_shard_index,
-    size_t source_shard_count,
-    DistributedShuffleJoinTableSide side,
-    size_t source_shard_index)
-{
-    getReceiver(target_shard_index).finishSource(id, source_shard_count, side, source_shard_index);
-}
-
-void LocalDistributedShuffleJoinBlockSender::cancel(const DistributedShuffleJoinExchangeId & id, String reason) noexcept
-{
-    for (auto * receiver : receivers)
-    {
-        try
-        {
-            receiver->cancelExchange(id, reason);
-        }
-        catch (...)
-        {
-            tryLogCurrentException(__PRETTY_FUNCTION__, "Failed to cancel distributed `shuffle join` exchange");
-        }
-    }
-}
-
-DistributedShuffleJoinExchangeReceiver & LocalDistributedShuffleJoinBlockSender::getReceiver(size_t target_shard_index) const
-{
-    if (target_shard_index >= receivers.size())
-    {
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "Target shard index {} is out of range for distributed `shuffle join` local sender with {} receivers",
-            target_shard_index,
-            receivers.size());
-    }
-
-    return *receivers[target_shard_index];
-}
-
 DistributedShuffleJoinSink::DistributedShuffleJoinSink(
     SharedHeader header,
-    DistributedShuffleJoinExchangeId exchange_id_,
-    size_t source_shard_count_,
-    size_t source_shard_index_,
+    DistributedShuffleJoinTableNames table_names_,
     size_t target_shard_count_,
     DistributedShuffleJoinTableSide side_,
     DistributedShuffleJoinSelector selector_,
     DistributedShuffleJoinBlockSenderPtr sender_)
     : SinkToStorage(std::move(header))
-    , exchange_id(std::move(exchange_id_))
-    , source_shard_count(source_shard_count_)
-    , source_shard_index(source_shard_index_)
+    , table_names(std::move(table_names_))
     , target_shard_count(target_shard_count_)
     , side(side_)
     , selector(std::move(selector_))
     , sender(std::move(sender_))
 {
-    if (source_shard_count == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` sink must have at least one source shard");
-
-    if (source_shard_index >= source_shard_count)
-    {
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "Source shard index {} is out of range for distributed `shuffle join` sink with {} source shards",
-            source_shard_index,
-            source_shard_count);
-    }
-
     if (target_shard_count == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` sink must have at least one target shard");
 
@@ -128,11 +48,9 @@ void DistributedShuffleJoinSink::consume(Chunk & chunk)
             continue;
 
         sender->sendBlock(
-            exchange_id,
+            table_names,
             target_shard_index,
-            source_shard_count,
             side,
-            source_shard_index,
             std::move(split_blocks[target_shard_index]));
     }
 }
@@ -146,7 +64,7 @@ void DistributedShuffleJoinSink::onCancel() noexcept
 {
     try
     {
-        sender->cancel(exchange_id, "Distributed `shuffle join` sink was cancelled");
+        sender->cancel(table_names, "Distributed `shuffle join` sink was cancelled");
     }
     catch (...)
     {
@@ -208,11 +126,9 @@ void DistributedShuffleJoinSink::finishAllTargets()
     for (size_t target_shard_index = 0; target_shard_index < target_shard_count; ++target_shard_index)
     {
         sender->finish(
-            exchange_id,
+            table_names,
             target_shard_index,
-            source_shard_count,
-            side,
-            source_shard_index);
+            side);
     }
 
     finished = true;

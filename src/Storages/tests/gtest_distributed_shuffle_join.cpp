@@ -1,10 +1,12 @@
-#include <Storages/DistributedShuffleJoinExchange.h>
 #include <Storages/DistributedShuffleJoinSelector.h>
 #include <Storages/DistributedShuffleJoinSink.h>
+#include <Storages/DistributedShuffleJoinTables.h>
 
 #include <Columns/ColumnsNumber.h>
+#include <Common/Exception.h>
 #include <Core/Block.h>
 #include <Core/Settings.h>
+#include <Interpreters/DistributedShuffleJoinCoordinator.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/Cluster.h>
 #include <Processors/Chunk.h>
@@ -12,9 +14,16 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <optional>
 
 namespace DB
 {
+namespace ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+}
+
 namespace
 {
 
@@ -84,6 +93,123 @@ std::vector<UInt64> collectIds(const std::vector<Block> & blocks)
     return ids;
 }
 
+class CapturingShuffleTableBlockSender final : public DistributedShuffleJoinBlockSender
+{
+public:
+    explicit CapturingShuffleTableBlockSender(size_t target_shard_count_)
+        : target_shards(target_shard_count_)
+    {
+    }
+
+    void sendBlock(
+        const DistributedShuffleJoinTableNames & table_names,
+        size_t target_shard_index,
+        DistributedShuffleJoinTableSide side,
+        Block block) override
+    {
+        auto & target = getTarget(target_shard_index);
+        target.table_names = table_names;
+        target.blocks[sideIndex(side)].push_back(std::move(block));
+    }
+
+    void finish(
+        const DistributedShuffleJoinTableNames & table_names,
+        size_t target_shard_index,
+        DistributedShuffleJoinTableSide side) override
+    {
+        auto & target = getTarget(target_shard_index);
+        target.table_names = table_names;
+        ++target.finish_counts[sideIndex(side)];
+    }
+
+    void cancel(const DistributedShuffleJoinTableNames &, String) noexcept override
+    {
+        cancelled = true;
+    }
+
+    const std::vector<Block> & getBlocks(size_t target_shard_index, DistributedShuffleJoinTableSide side) const
+    {
+        return getTarget(target_shard_index).blocks[sideIndex(side)];
+    }
+
+    size_t getFinishCount(size_t target_shard_index, DistributedShuffleJoinTableSide side) const
+    {
+        return getTarget(target_shard_index).finish_counts[sideIndex(side)];
+    }
+
+    bool wasCancelled() const
+    {
+        return cancelled;
+    }
+
+private:
+    struct TargetShardData
+    {
+        DistributedShuffleJoinTableNames table_names;
+        std::array<std::vector<Block>, 2> blocks;
+        std::array<size_t, 2> finish_counts = {};
+    };
+
+    static size_t sideIndex(DistributedShuffleJoinTableSide side)
+    {
+        return side == DistributedShuffleJoinTableSide::Left ? 0 : 1;
+    }
+
+    TargetShardData & getTarget(size_t target_shard_index)
+    {
+        if (target_shard_index >= target_shards.size())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Target shard index {} is out of range", target_shard_index);
+
+        return target_shards[target_shard_index];
+    }
+
+    const TargetShardData & getTarget(size_t target_shard_index) const
+    {
+        if (target_shard_index >= target_shards.size())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Target shard index {} is out of range", target_shard_index);
+
+        return target_shards[target_shard_index];
+    }
+
+    std::vector<TargetShardData> target_shards;
+    bool cancelled = false;
+};
+
+class RecordingShuffleQueryExecutor final : public IDistributedShuffleJoinQueryExecutor
+{
+public:
+    struct ExecutedQuery
+    {
+        size_t shard_index;
+        String query;
+    };
+
+    void executeOnShard(size_t shard_index, const String & query) override
+    {
+        if (fail_at_query_index && queries.size() == *fail_at_query_index)
+        {
+            fail_at_query_index.reset();
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Injected distributed `shuffle join` query executor failure");
+        }
+
+        queries.push_back(ExecutedQuery{.shard_index = shard_index, .query = query});
+    }
+
+    void failAtQueryIndex(size_t query_index)
+    {
+        fail_at_query_index = query_index;
+    }
+
+    const std::vector<ExecutedQuery> & getQueries() const
+    {
+        return queries;
+    }
+
+private:
+    std::vector<ExecutedQuery> queries;
+    std::optional<size_t> fail_at_query_index;
+};
+
 void consumeOneBlock(DistributedShuffleJoinSink & sink, const std::vector<UInt64> & ids)
 {
     auto chunk = makeChunk(ids);
@@ -93,66 +219,125 @@ void consumeOneBlock(DistributedShuffleJoinSink & sink, const std::vector<UInt64
 
 }
 
-TEST(DistributedShuffleJoin, LocalSinkReceiverExchangeRoundTrip)
+TEST(DistributedShuffleJoin, SinkPartitionsBlocksForShuffleTables)
 {
-    DistributedShuffleJoinExchangeRegistry target0_registry;
-    DistributedShuffleJoinExchangeRegistry target1_registry;
-
-    DistributedShuffleJoinExchangeReceiver target0_receiver(target0_registry);
-    DistributedShuffleJoinExchangeReceiver target1_receiver(target1_registry);
-
-    auto sender = std::make_shared<LocalDistributedShuffleJoinBlockSender>(
-        std::vector<DistributedShuffleJoinExchangeReceiver *>{&target0_receiver, &target1_receiver});
+    auto sender = std::make_shared<CapturingShuffleTableBlockSender>(2);
     auto selector = createDistributedShuffleJoinSelector(makeTwoShardCluster(), "id");
 
     const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "local-shuffle-test", .join_id = 0};
-    constexpr size_t source_shard_count = 2;
+    const auto table_names = createDistributedShuffleJoinTableNames("default", exchange_id);
     constexpr size_t target_shard_count = 2;
 
-    auto make_sink = [&](DistributedShuffleJoinTableSide side, size_t source_shard_index)
+    auto make_sink = [&](DistributedShuffleJoinTableSide side)
     {
         return DistributedShuffleJoinSink(
             makeHeader(),
-            exchange_id,
-            source_shard_count,
-            source_shard_index,
+            table_names,
             target_shard_count,
             side,
             selector,
             sender);
     };
 
-    auto left_source0 = make_sink(DistributedShuffleJoinTableSide::Left, 0);
-    auto left_source1 = make_sink(DistributedShuffleJoinTableSide::Left, 1);
-    auto right_source0 = make_sink(DistributedShuffleJoinTableSide::Right, 0);
-    auto right_source1 = make_sink(DistributedShuffleJoinTableSide::Right, 1);
+    auto left_source0 = make_sink(DistributedShuffleJoinTableSide::Left);
+    auto left_source1 = make_sink(DistributedShuffleJoinTableSide::Left);
+    auto right_source0 = make_sink(DistributedShuffleJoinTableSide::Right);
+    auto right_source1 = make_sink(DistributedShuffleJoinTableSide::Right);
 
     consumeOneBlock(left_source0, {1, 2});
     consumeOneBlock(left_source1, {3, 4});
     consumeOneBlock(right_source0, {2, 3});
     consumeOneBlock(right_source1, {1, 4});
 
-    auto target0_exchange = target0_registry.find(exchange_id);
-    auto target1_exchange = target1_registry.find(exchange_id);
+    EXPECT_EQ(collectIds(sender->getBlocks(0, DistributedShuffleJoinTableSide::Left)), std::vector<UInt64>({2, 4}));
+    EXPECT_EQ(collectIds(sender->getBlocks(0, DistributedShuffleJoinTableSide::Right)), std::vector<UInt64>({2, 4}));
+    EXPECT_EQ(collectIds(sender->getBlocks(1, DistributedShuffleJoinTableSide::Left)), std::vector<UInt64>({1, 3}));
+    EXPECT_EQ(collectIds(sender->getBlocks(1, DistributedShuffleJoinTableSide::Right)), std::vector<UInt64>({1, 3}));
 
-    ASSERT_NE(target0_exchange, nullptr);
-    ASSERT_NE(target1_exchange, nullptr);
+    EXPECT_EQ(sender->getFinishCount(0, DistributedShuffleJoinTableSide::Left), 2);
+    EXPECT_EQ(sender->getFinishCount(1, DistributedShuffleJoinTableSide::Left), 2);
+    EXPECT_EQ(sender->getFinishCount(0, DistributedShuffleJoinTableSide::Right), 2);
+    EXPECT_EQ(sender->getFinishCount(1, DistributedShuffleJoinTableSide::Right), 2);
+    EXPECT_FALSE(sender->wasCancelled());
+}
 
-    EXPECT_TRUE(target0_exchange->waitReadyFor(std::chrono::milliseconds(0)));
-    EXPECT_TRUE(target1_exchange->waitReadyFor(std::chrono::milliseconds(0)));
+TEST(DistributedShuffleJoin, CreatesMemoryTableNamesAndQueries)
+{
+    const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "query-with-dashes", .join_id = 7};
+    const auto table_names = createDistributedShuffleJoinTableNames("default", exchange_id);
 
-    EXPECT_EQ(collectIds(target0_exchange->getBlocks(DistributedShuffleJoinTableSide::Left)), std::vector<UInt64>({2, 4}));
-    EXPECT_EQ(collectIds(target0_exchange->getBlocks(DistributedShuffleJoinTableSide::Right)), std::vector<UInt64>({2, 4}));
-    EXPECT_EQ(collectIds(target1_exchange->getBlocks(DistributedShuffleJoinTableSide::Left)), std::vector<UInt64>({1, 3}));
-    EXPECT_EQ(collectIds(target1_exchange->getBlocks(DistributedShuffleJoinTableSide::Right)), std::vector<UInt64>({1, 3}));
+    EXPECT_EQ(table_names.left_table, "_shuffle_query_with_dashes_7_left");
+    EXPECT_EQ(table_names.right_table, "_shuffle_query_with_dashes_7_right");
+    EXPECT_EQ(table_names.getQualifiedTableName(DistributedShuffleJoinTableSide::Left), "default._shuffle_query_with_dashes_7_left");
 
-    const auto target0_left_stats = target0_exchange->getStats(DistributedShuffleJoinTableSide::Left);
-    const auto target1_right_stats = target1_exchange->getStats(DistributedShuffleJoinTableSide::Right);
+    EXPECT_EQ(
+        createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader()),
+        "CREATE TABLE IF NOT EXISTS default._shuffle_query_with_dashes_7_left (id UInt64) ENGINE = Memory");
+    EXPECT_EQ(
+        dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right),
+        "DROP TABLE IF EXISTS default._shuffle_query_with_dashes_7_right");
+}
 
-    EXPECT_EQ(target0_left_stats.blocks, 2);
-    EXPECT_EQ(target0_left_stats.rows, 2);
-    EXPECT_EQ(target1_right_stats.blocks, 2);
-    EXPECT_EQ(target1_right_stats.rows, 2);
+TEST(DistributedShuffleJoin, CoordinatorPreparesAndCleansMemoryTables)
+{
+    const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "coordinator-test", .join_id = 3};
+    const auto table_names = createDistributedShuffleJoinTableNames("default", exchange_id);
+
+    RecordingShuffleQueryExecutor executor;
+    DistributedShuffleJoinCoordinator coordinator(table_names, *makeHeader(), *makeHeader(), 2, executor);
+
+    coordinator.prepareShuffleTables();
+    EXPECT_TRUE(coordinator.hasPreparedShuffleTables());
+
+    const auto create_left = createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader());
+    const auto create_right = createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Right, *makeHeader());
+    const auto drop_left = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Left);
+    const auto drop_right = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right);
+
+    ASSERT_EQ(executor.getQueries().size(), 4);
+    EXPECT_EQ(executor.getQueries()[0].shard_index, 0);
+    EXPECT_EQ(executor.getQueries()[0].query, create_left);
+    EXPECT_EQ(executor.getQueries()[1].shard_index, 1);
+    EXPECT_EQ(executor.getQueries()[1].query, create_left);
+    EXPECT_EQ(executor.getQueries()[2].shard_index, 0);
+    EXPECT_EQ(executor.getQueries()[2].query, create_right);
+    EXPECT_EQ(executor.getQueries()[3].shard_index, 1);
+    EXPECT_EQ(executor.getQueries()[3].query, create_right);
+
+    coordinator.cleanupShuffleTables();
+    EXPECT_TRUE(coordinator.hasCleanedUpShuffleTables());
+
+    ASSERT_EQ(executor.getQueries().size(), 8);
+    EXPECT_EQ(executor.getQueries()[4].query, drop_left);
+    EXPECT_EQ(executor.getQueries()[5].query, drop_left);
+    EXPECT_EQ(executor.getQueries()[6].query, drop_right);
+    EXPECT_EQ(executor.getQueries()[7].query, drop_right);
+}
+
+TEST(DistributedShuffleJoin, CoordinatorCleansMemoryTablesAfterPrepareFailure)
+{
+    const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "coordinator-failure-test", .join_id = 4};
+    const auto table_names = createDistributedShuffleJoinTableNames("default", exchange_id);
+
+    RecordingShuffleQueryExecutor executor;
+    executor.failAtQueryIndex(2);
+
+    DistributedShuffleJoinCoordinator coordinator(table_names, *makeHeader(), *makeHeader(), 2, executor);
+
+    EXPECT_THROW(coordinator.prepareShuffleTables(), Exception);
+    EXPECT_FALSE(coordinator.hasPreparedShuffleTables());
+    EXPECT_TRUE(coordinator.hasCleanedUpShuffleTables());
+
+    const auto drop_left = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Left);
+    const auto drop_right = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right);
+
+    ASSERT_EQ(executor.getQueries().size(), 6);
+    EXPECT_EQ(executor.getQueries()[0].query, createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader()));
+    EXPECT_EQ(executor.getQueries()[1].query, createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader()));
+    EXPECT_EQ(executor.getQueries()[2].query, drop_left);
+    EXPECT_EQ(executor.getQueries()[3].query, drop_left);
+    EXPECT_EQ(executor.getQueries()[4].query, drop_right);
+    EXPECT_EQ(executor.getQueries()[5].query, drop_right);
 }
 
 TEST(DistributedShuffleJoin, SelectorUsesJoinKeyColumn)
