@@ -303,7 +303,9 @@ initiator:
 - `src/Core/Settings.cpp`：新增实验 setting `distributed_shuffle_join`，默认关闭。当前只作为功能入口开关，尚未接入执行路径。
 - `src/Storages/DistributedShuffleJoinAnalyzer.h` 和 `src/Storages/DistributedShuffleJoinAnalyzer.cpp`：新增 `DistributedShuffleJoinAnalyzer` helper。它只负责判断一条 query 是否满足 MVP `shuffle join` 条件，并提取左右 `StorageDistributed`、`JOIN` key、cluster、shard 数、所需列等信息；它不负责改写 SQL，也不负责执行。
 
-当前工作区新增但尚未提交的文件：
+当前 `exchange` 分支相对 `master` 已提交的新增文件和作用：
+
+- 最新提交 `dc1c853f5e5 Add distributed shuffle join selector builder` 已把 selector builder 和对应测试收进分支。
 
 - `src/Storages/DistributedShuffleJoinExchange.h` 和 `src/Storages/DistributedShuffleJoinExchange.cpp`：新增 receiver-side 的 `exchange` 状态与内存数据容器。
   - `DistributedShuffleJoinExchangeId` 用 `initial_query_id + join_id` 标识一次 `shuffle join`。
@@ -326,6 +328,8 @@ initiator:
   - target exchange 中的 blocks、rows 统计符合预期。
   - 当前测试已改为通过 `createDistributedShuffleJoinSelector` 构造 selector，不再直接在测试中硬编码 `% 2` 作为 sink 的 selector。
   - 新增 `SelectorUsesJoinKeyColumn` 测试，验证 left/right block 只要 key value 相同，就会被 selector 分配到同一个 target shard。
+
+上述文件目前是已提交状态，不是未提交草稿。后续开发如果新增一个阶段性能力，例如 remote sender/receiver、final local `JOIN` source 或 planner 接入，需要继续在本节追加新的阶段进度。
 
 当前已经验证过的编译目标：
 
