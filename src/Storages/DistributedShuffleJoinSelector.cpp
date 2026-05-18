@@ -6,6 +6,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/createBlockSelector.h>
+#include <Storages/DistributedShuffleJoinAnalyzer.h>
 
 namespace DB
 {
@@ -65,6 +66,18 @@ DistributedShuffleJoinSelector createDistributedShuffleJoinSelector(ClusterPtr c
 
         throw Exception(ErrorCodes::TYPE_MISMATCH, "Distributed `shuffle join` key column {} does not have an integer type", captured_key_column_name);
     };
+}
+
+DistributedShuffleJoinSelector createDistributedShuffleJoinSelector(
+    ClusterPtr cluster,
+    const DistributedShuffleJoinInfo & info,
+    DistributedShuffleJoinTableSide side)
+{
+    const auto & key_column_name = side == DistributedShuffleJoinTableSide::Left
+        ? info.left_key_column_name
+        : info.right_key_column_name;
+
+    return createDistributedShuffleJoinSelector(std::move(cluster), key_column_name);
 }
 
 }

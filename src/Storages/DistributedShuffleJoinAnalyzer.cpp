@@ -85,7 +85,22 @@ bool collectUsingJoinKeys(DistributedShuffleJoinInfo & info, const JoinNode & jo
 
     info.left_key_expression = list_node->getNodes().front();
     info.right_key_expression = list_node->getNodes().front();
+    info.left_key_column_name = using_column_node->getColumnName();
+    info.right_key_column_name = using_column_node->getColumnName();
     return true;
+}
+
+const ColumnNode * getDirectKeyColumn(const QueryTreeNodePtr & node, const QueryTreeNodePtr & expected_source)
+{
+    const auto * column_node = node->as<ColumnNode>();
+    if (!column_node)
+        return nullptr;
+
+    auto column_source = column_node->getColumnSourceOrNull();
+    if (!column_source || !column_source->isEqual(*expected_source))
+        return nullptr;
+
+    return column_node;
 }
 
 bool collectOnJoinKeys(DistributedShuffleJoinInfo & info, const JoinNode & join_node)
@@ -110,6 +125,14 @@ bool collectOnJoinKeys(DistributedShuffleJoinInfo & info, const JoinNode & join_
 
     info.left_key_expression = left_to_right ? arguments[0] : arguments[1];
     info.right_key_expression = left_to_right ? arguments[1] : arguments[0];
+
+    const auto * left_key_column = getDirectKeyColumn(info.left_key_expression, info.left_table_expression);
+    const auto * right_key_column = getDirectKeyColumn(info.right_key_expression, info.right_table_expression);
+    if (!left_key_column || !right_key_column)
+        return false;
+
+    info.left_key_column_name = left_key_column->getColumnName();
+    info.right_key_column_name = right_key_column->getColumnName();
     return true;
 }
 
@@ -127,6 +150,24 @@ void collectRequiredColumns(DistributedShuffleJoinInfo & info, QueryTreeNodePtr 
     auto right_columns_it = columns.find(info.right_table_expression);
     if (right_columns_it != columns.end())
         info.right_required_columns = right_columns_it->second.columns;
+}
+
+void addRequiredColumnIfMissing(NamesAndTypes & required_columns, NameAndTypePair column)
+{
+    for (const auto & required_column : required_columns)
+        if (required_column.name == column.name)
+            return;
+
+    required_columns.push_back(std::move(column));
+}
+
+void ensureKeyColumnsAreRequired(DistributedShuffleJoinInfo & info)
+{
+    if (const auto * left_key_column = info.left_key_expression->as<ColumnNode>())
+        addRequiredColumnIfMissing(info.left_required_columns, left_key_column->getColumn());
+
+    if (const auto * right_key_column = info.right_key_expression->as<ColumnNode>())
+        addRequiredColumnIfMissing(info.right_required_columns, right_key_column->getColumn());
 }
 
 }
@@ -190,6 +231,7 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
         return {};
 
     collectRequiredColumns(info, query_tree);
+    ensureKeyColumnsAreRequired(info);
     return info;
 }
 

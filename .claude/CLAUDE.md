@@ -305,7 +305,7 @@ integration tests 至少覆盖：
 
 ### 当前实现进度
 
-截至 `2026-05-12`，`exchange` 分支相对 `master` 的 `shuffle join` 相关进度如下。这个小节用于协作交接；后续每完成一个独立阶段，都需要同步更新这里。
+截至 `2026-05-13`，`exchange` 分支相对 `master` 的 `shuffle join` 相关进度如下。这个小节用于协作交接；后续每完成一个独立阶段，都需要同步更新这里。
 
 已提交到当前分支的基础改动：
 
@@ -338,6 +338,11 @@ integration tests 至少覆盖：
 - `src/Storages/DistributedShuffleJoinSink.h` 和 `src/Storages/DistributedShuffleJoinSink.cpp`：`DistributedShuffleJoinSink` 现在携带 `DistributedShuffleJoinTableNames`，并把表名上下文传给 `DistributedShuffleJoinBlockSender`。
   - 这样后续 remote sender 可以直接使用 side 对应的 `_shuffle_*` 表执行 `INSERT`。
   - 已删除 `source_shard_count`、`source_shard_index` 和 registry-style finish 语义；barrier 由 coordinator 等待所有 Exchange 请求返回来表达。
+- `src/Storages/DistributedShuffleJoinBlockSender.h` 和 `src/Storages/DistributedShuffleJoinBlockSender.cpp`：新增基于 cluster 的真实 table sender。
+  - `ClusterDistributedShuffleJoinBlockSender` 以 `(target shard, side)` 为粒度复用 pushing pipeline。
+  - target shard 是本地节点时，使用 `InterpreterInsertQuery` 构造本地 `INSERT INTO _shuffle_*` pipeline。
+  - target shard 是远端节点时，使用 `ConnectionPoolWithFailover` 获取连接，再通过 `RemoteSink` 推送 `INSERT INTO _shuffle_*` block。
+  - `finish` 会收口对应 target/side 的 pushing pipeline；`cancel` 和析构会 best-effort 取消仍在运行的 job。
 - 已删除 `src/Storages/DistributedShuffleJoinExchange.h` 和 `src/Storages/DistributedShuffleJoinExchange.cpp`。
   - 这些文件属于旧的内部 registry 方案，不再符合当前 `Memory` 表 MVP 主线。
 - `src/Core/Settings.cpp`：新增实验 setting `shuffle_exchange_timeout_ms`，默认 `300000`。
@@ -352,12 +357,14 @@ integration tests 至少覆盖：
 
    - 已有实验 setting `distributed_shuffle_join`，默认关闭。
    - 已有 `DistributedShuffleJoinAnalyzer`，用于判断 MVP 查询是否能走 `shuffle join`：目前目标是 `enable_analyzer = 1`、左右都是直接 `StorageDistributed`、同 cluster、简单等值 `INNER ALL JOIN`。
+   - analyzer 已经提取 left/right 直接 key 列名；`ON` 形态目前收窄为左右两侧直接列等值条件，复杂表达式 key 仍不走 MVP 路径。
    - analyzer 目前只做资格判断和信息提取，不会自动改写 query，也不会启动执行。
 
 2. 分桶 selector
 
    - 已有 `DistributedShuffleJoinSelector`。
    - `createDistributedShuffleJoinSelector` 可以基于 `ClusterPtr` 和直接 key 列名创建 selector。
+   - `createDistributedShuffleJoinSelector` 也可以基于 `DistributedShuffleJoinInfo` 和 left/right side 创建 selector，后续 Exchange pipeline 可以直接使用 analyzer 输出。
    - selector 复用 `createBlockSelector` 和 cluster 的 `slot_to_shard`，不是测试里手写的固定 `% 2`。
    - 当前只支持直接列 key 和整数类 key，复杂表达式、`String`、`Nullable` 等还没支持。
 
@@ -389,13 +396,21 @@ integration tests 至少覆盖：
    - sink 接收输入 `Block`，按 selector 计算每行目标 target shard。
    - sink 使用 `IColumn::scatter` 将 block 拆成多个目标 shard block。
    - sink 会把拆出来的 block 交给 `DistributedShuffleJoinBlockSender` 抽象。
-   - 当前 sender 只有 gtest 中的 capturing fake，还没有真实 `RemoteSink` / `INSERT` sender。
+   - gtest 里仍保留 capturing fake，用来做纯分桶断言。
 
-7. 单测覆盖
+7. 真实 table sender
+
+   - 已有 `ClusterDistributedShuffleJoinBlockSender`。
+   - 本地 target shard 走 `InterpreterInsertQuery` + `PushingPipelineExecutor`，把 block 写入本机 `_shuffle_*` `Memory` 表。
+   - 远端 target shard 走 `ConnectionPoolWithFailover` + `RemoteSink`，把 block 通过 `INSERT INTO _shuffle_*` 推到目标 shard。
+   - sender 以 `(target shard, side)` 为单位懒初始化 pipeline，并在 `finish` 时结束对应写入会话。
+   - 这一步已经补上“拆桶之后如何把 bucket block 真正发往目标 `_shuffle_*` 表”的独立组件，但它还没有被真实 Exchange 查询路径实例化并串起来。
+
+8. 单测覆盖
 
    - 已有 `DistributedShuffleJoin.*` gtest。
-   - 当前覆盖 selector 分桶、`_shuffle_*` 表名和 SQL 生成、coordinator prepare/cleanup、prepare 失败清理。
-   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，5 个测试全部成功。
+   - 当前覆盖 selector 分桶、从 analyzer info 创建 selector、`_shuffle_*` 表名和 SQL 生成、required columns 到 header 的转换、coordinator prepare/cleanup、prepare 失败清理。
+   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，7 个测试全部成功。
 
 当前已实现能力对应的真实 SQL 例子：
 
@@ -562,7 +577,7 @@ SETTINGS distributed_shuffle_join = 1
   -> initiator 汇总结果
 ```
 
-所以当前实现可以概括为：已经有“能判断、能命名、能建表、能清理、能把 block 拆桶”的组件；还没有完成“把拆出来的 block 真正 `INSERT` 到目标 shard 的 `_shuffle_*` 表，以及最后自动执行本地 `JOIN`”。
+所以当前实现可以概括为：已经有“能判断、能命名、能建表、能清理、能把 block 拆桶、也已经有真实 table sender”的组件；还没有完成“把 source shard 上的扫描 pipeline 接到 sender、把 Exchange 真正串起来，以及最后自动执行本地 `JOIN`”。
 
 当前主线判断：
 
@@ -573,6 +588,7 @@ SETTINGS distributed_shuffle_join = 1
 
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinAnalyzer.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Core/Settings.cpp.o`
+- `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinBlockSender.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Interpreters/DistributedShuffleJoinCoordinator.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSink.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSelector.cpp.o`
@@ -586,8 +602,8 @@ SETTINGS distributed_shuffle_join = 1
 
 当前代码还没有完成的部分：
 
-- `DistributedShuffleJoinSink` 的 selector 目前仍由外部传入，但已经有 MVP 版 `createDistributedShuffleJoinSelector` 可根据直接 key 列构造 selector。复杂表达式 key 尚未接入。
-- 目前只有 gtest 内的 capturing sender，还没有真正的 `RemoteSink` / `INSERT` sender。
+- `DistributedShuffleJoinSink` 的 selector 目前仍由外部传入，但已经可以根据 `DistributedShuffleJoinAnalyzer` 输出的 left/right key column 构造 selector。复杂表达式 key 尚未接入。
+- 已有 `ClusterDistributedShuffleJoinBlockSender`，但真实 Exchange 查询路径还没有实例化它，也还没有把 source shard 上的左右表扫描 pipeline 接到它。
 - coordinator 目前只完成 `Prepare` 和 `Cleanup`，并已有基于 `ConnectionPoolWithFailover` 的真实 query executor；但它还没有接入真实 distributed query path，也还没有实现 `Exchange -> Barrier -> Local JOIN`。
 - 还没有把 `_shuffle_*` 普通 `Memory` 表写入、查询、清理接入真实 distributed query path。
 - 尚未接入 `StorageDistributed::read`、`ClusterProxy::executeQuery` 或更合适的 planner 入口。
@@ -595,10 +611,8 @@ SETTINGS distributed_shuffle_join = 1
 
 下一步建议：
 
-1. 实现基于 `RemoteSink` / `RemoteInserter` 或等价 `INSERT` pipeline 的 sender，把 `DistributedShuffleJoinSink` 分出来的 blocks 写入目标 shard 的 `_shuffle_*` 表。
-2. 把 `DistributedShuffleJoinAnalyzer` 提取到的 left/right key column 接到 `createDistributedShuffleJoinSelector`，让左右 sink 使用各自的 key 列名构造 selector。
-3. 实现 Exchange 请求处理：每个 source shard 读本地表一次，分别对 left/right 表构建 push pipeline，写入 shuffle 表。
-4. Exchange 全部成功后，下发读取 `_shuffle_*` 表的 local `JOIN` SQL，并在正常或异常退出时清理表。
+1. 实现 Exchange 请求处理：每个 source shard 读本地表一次，分别对 left/right 表构建 push pipeline，并实例化 `ClusterDistributedShuffleJoinBlockSender` 写入 shuffle 表。
+2. Exchange 全部成功后，下发读取 `_shuffle_*` 表的 local `JOIN` SQL，并在正常或异常退出时清理表。
 
 ### 未来产品化方向
 

@@ -1,3 +1,4 @@
+#include <Storages/DistributedShuffleJoinAnalyzer.h>
 #include <Storages/DistributedShuffleJoinSelector.h>
 #include <Storages/DistributedShuffleJoinSink.h>
 #include <Storages/DistributedShuffleJoinTables.h>
@@ -278,6 +279,24 @@ TEST(DistributedShuffleJoin, CreatesMemoryTableNamesAndQueries)
         "DROP TABLE IF EXISTS default._shuffle_query_with_dashes_7_right");
 }
 
+TEST(DistributedShuffleJoin, CreatesMemoryTableHeaderFromRequiredColumns)
+{
+    const NamesAndTypes required_columns
+    {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"value", std::make_shared<DataTypeUInt64>()},
+    };
+
+    const auto header = createDistributedShuffleJoinTableHeader(required_columns);
+    ASSERT_EQ(header.columns(), 2);
+    EXPECT_EQ(header.getByPosition(0).name, "id");
+    EXPECT_EQ(header.getByPosition(1).name, "value");
+    EXPECT_EQ(header.getByPosition(0).type->getName(), "UInt64");
+    EXPECT_EQ(header.getByPosition(1).type->getName(), "UInt64");
+
+    EXPECT_THROW(createDistributedShuffleJoinTableHeader({}), Exception);
+}
+
 TEST(DistributedShuffleJoin, CoordinatorPreparesAndCleansMemoryTables)
 {
     const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "coordinator-test", .join_id = 3};
@@ -353,6 +372,30 @@ TEST(DistributedShuffleJoin, SelectorUsesJoinKeyColumn)
     EXPECT_EQ(left_selector[0], right_selector[1]);
     EXPECT_EQ(left_selector[1], right_selector[2]);
     EXPECT_EQ(left_selector[2], right_selector[0]);
+}
+
+TEST(DistributedShuffleJoin, SelectorCanBeCreatedFromAnalyzerInfo)
+{
+    DistributedShuffleJoinInfo info;
+    info.left_key_column_name = "id";
+    info.right_key_column_name = "id";
+
+    auto left_selector = createDistributedShuffleJoinSelector(
+        makeTwoShardCluster(),
+        info,
+        DistributedShuffleJoinTableSide::Left);
+    auto right_selector = createDistributedShuffleJoinSelector(
+        makeTwoShardCluster(),
+        info,
+        DistributedShuffleJoinTableSide::Right);
+
+    const auto left_targets = left_selector(makeBlock({1, 2}));
+    const auto right_targets = right_selector(makeBlock({2, 1}));
+
+    ASSERT_EQ(left_targets.size(), 2);
+    ASSERT_EQ(right_targets.size(), 2);
+    EXPECT_EQ(left_targets[0], right_targets[1]);
+    EXPECT_EQ(left_targets[1], right_targets[0]);
 }
 
 }

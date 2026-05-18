@@ -22,6 +22,8 @@ struct DistributedShuffleJoinInfo
 
     QueryTreeNodePtr left_key_expression;
     QueryTreeNodePtr right_key_expression;
+    String left_key_column_name;
+    String right_key_column_name;
 
     NamesAndTypes left_required_columns;
     NamesAndTypes right_required_columns;

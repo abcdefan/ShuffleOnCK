@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Core/Block.h>
+#include <Core/NamesAndTypes.h>
 #include <base/types.h>
 
 #include <cstdint>
@@ -46,6 +47,7 @@ struct DistributedShuffleJoinTableNames
 
 String makeDistributedShuffleJoinTableNamePrefix(const DistributedShuffleJoinExchangeId & id);
 DistributedShuffleJoinTableNames createDistributedShuffleJoinTableNames(String database, const DistributedShuffleJoinExchangeId & id);
+Block createDistributedShuffleJoinTableHeader(const NamesAndTypes & columns);
 
 String createDistributedShuffleJoinMemoryTableQuery(
     const DistributedShuffleJoinTableNames & table_names,

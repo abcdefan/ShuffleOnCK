@@ -124,6 +124,29 @@ DistributedShuffleJoinTableNames createDistributedShuffleJoinTableNames(String d
     };
 }
 
+Block createDistributedShuffleJoinTableHeader(const NamesAndTypes & columns)
+{
+    if (columns.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` Memory table cannot be created with empty columns");
+
+    Block header;
+    for (const auto & column : columns)
+    {
+        if (column.name.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` Memory table column has empty name");
+
+        if (!column.type)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Distributed `shuffle join` Memory table column {} does not have a type",
+                column.name);
+
+        header.insert(ColumnWithTypeAndName(column.type, column.name));
+    }
+
+    return header;
+}
+
 String createDistributedShuffleJoinMemoryTableQuery(
     const DistributedShuffleJoinTableNames & table_names,
     DistributedShuffleJoinTableSide side,
