@@ -172,6 +172,51 @@ void DistributedShuffleJoinCoordinator::prepareShuffleTables()
     }
 }
 
+void DistributedShuffleJoinCoordinator::exchangeShuffleTables(IDistributedShuffleJoinExchangeExecutor & exchange_executor)
+{
+    if (!prepared)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` tables must be prepared before exchange");
+
+    if (exchanged)
+        return;
+
+    try
+    {
+        exchangeForAllShards(exchange_executor);
+        exchanged = true;
+    }
+    catch (...)
+    {
+        cleanupShuffleTables();
+        throw;
+    }
+}
+
+void DistributedShuffleJoinCoordinator::joinShuffleTables(
+    const String & local_join_query,
+    IDistributedShuffleJoinLocalJoinExecutor & local_join_executor)
+{
+    if (!exchanged)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` tables must be exchanged before local join");
+
+    if (local_join_query.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` local join query cannot be empty");
+
+    if (joined)
+        return;
+
+    try
+    {
+        joinForAllShards(local_join_query, local_join_executor);
+        joined = true;
+    }
+    catch (...)
+    {
+        cleanupShuffleTables();
+        throw;
+    }
+}
+
 void DistributedShuffleJoinCoordinator::cleanupShuffleTables() noexcept
 {
     if (!prepare_started || cleaned_up)
@@ -197,12 +242,28 @@ void DistributedShuffleJoinCoordinator::cleanupShuffleTables() noexcept
 
     cleaned_up = true;
     prepared = false;
+    exchanged = false;
+    joined = false;
 }
 
 void DistributedShuffleJoinCoordinator::executeForAllShards(const String & query)
 {
     for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
         executor.executeOnShard(shard_index, query);
+}
+
+void DistributedShuffleJoinCoordinator::exchangeForAllShards(IDistributedShuffleJoinExchangeExecutor & exchange_executor)
+{
+    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
+        exchange_executor.executeOnShard(shard_index, table_names);
+}
+
+void DistributedShuffleJoinCoordinator::joinForAllShards(
+    const String & local_join_query,
+    IDistributedShuffleJoinLocalJoinExecutor & local_join_executor)
+{
+    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
+        local_join_executor.executeOnShard(shard_index, local_join_query);
 }
 
 }

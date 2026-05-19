@@ -397,6 +397,14 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
                 res->coverage_test_name = ast->as<ASTLiteral &>().value.safeGet<String>();
             break;
         }
+        case Type::DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE:
+        {
+            ASTPtr ast;
+            if (!ParserStringLiteral{}.parse(pos, ast, expected))
+                return false;
+            res->distributed_shuffle_join_exchange_payload = ast->as<ASTLiteral &>().value.safeGet<String>();
+            break;
+        }
 
         case Type::RESTART_REPLICA:
         case Type::SYNC_REPLICA:

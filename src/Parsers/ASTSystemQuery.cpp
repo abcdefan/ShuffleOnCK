@@ -257,6 +257,11 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
 
             break;
         }
+        case Type::DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE:
+        {
+            ostr << " " << quoteString(distributed_shuffle_join_exchange_payload);
+            break;
+        }
         case Type::RELOAD_DICTIONARY:
         case Type::RELOAD_MODEL:
         case Type::RELOAD_FUNCTION:

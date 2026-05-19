@@ -20,7 +20,25 @@ public:
     virtual void executeOnShard(size_t shard_index, const String & query) = 0;
 };
 
-class ClusterDistributedShuffleJoinQueryExecutor final : public IDistributedShuffleJoinQueryExecutor
+class IDistributedShuffleJoinExchangeExecutor
+{
+public:
+    virtual ~IDistributedShuffleJoinExchangeExecutor() = default;
+
+    virtual void executeOnShard(size_t shard_index, const DistributedShuffleJoinTableNames & table_names) = 0;
+};
+
+class IDistributedShuffleJoinLocalJoinExecutor
+{
+public:
+    virtual ~IDistributedShuffleJoinLocalJoinExecutor() = default;
+
+    virtual void executeOnShard(size_t shard_index, const String & query) = 0;
+};
+
+class ClusterDistributedShuffleJoinQueryExecutor final
+    : public IDistributedShuffleJoinQueryExecutor
+    , public IDistributedShuffleJoinLocalJoinExecutor
 {
 public:
     ClusterDistributedShuffleJoinQueryExecutor(ClusterPtr cluster_, ContextPtr context_);
@@ -58,6 +76,8 @@ public:
     }
 
     void prepareShuffleTables();
+    void exchangeShuffleTables(IDistributedShuffleJoinExchangeExecutor & exchange_executor);
+    void joinShuffleTables(const String & local_join_query, IDistributedShuffleJoinLocalJoinExecutor & local_join_executor);
     void cleanupShuffleTables() noexcept;
 
     bool hasPreparedShuffleTables() const
@@ -70,8 +90,20 @@ public:
         return cleaned_up;
     }
 
+    bool hasExchangedShuffleTables() const
+    {
+        return exchanged;
+    }
+
+    bool hasJoinedShuffleTables() const
+    {
+        return joined;
+    }
+
 private:
     void executeForAllShards(const String & query);
+    void exchangeForAllShards(IDistributedShuffleJoinExchangeExecutor & exchange_executor);
+    void joinForAllShards(const String & local_join_query, IDistributedShuffleJoinLocalJoinExecutor & local_join_executor);
 
     const DistributedShuffleJoinTableNames table_names;
     const Block left_header;
@@ -81,6 +113,8 @@ private:
 
     bool prepare_started = false;
     bool prepared = false;
+    bool exchanged = false;
+    bool joined = false;
     bool cleaned_up = false;
 };
 

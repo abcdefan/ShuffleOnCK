@@ -150,6 +150,7 @@ namespace ErrorCodes
     extern const int UNSUPPORTED_METHOD;
     extern const int DELTA_KERNEL_ERROR;
     extern const int FAULT_INJECTED;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace FailPoints
@@ -1164,6 +1165,10 @@ BlockIO InterpreterSystemQuery::execute()
         case Type::RESET_DDL_WORKER:
             getContext()->getDDLWorker().requestToResetState();
             break;
+        case Type::DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE:
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Distributed `shuffle join` exchange request execution is not implemented yet");
         default:
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown type of SYSTEM query");
     }
@@ -2578,6 +2583,7 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::DISABLE_FAILPOINT:
         case Type::RESET_COVERAGE:
         case Type::SET_COVERAGE_TEST:
+        case Type::DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE:
         case Type::UNKNOWN:
         case Type::RESET_DDL_WORKER:
         case Type::END: break;

@@ -333,11 +333,31 @@ integration tests 至少覆盖：
   - `ClusterDistributedShuffleJoinQueryExecutor` 是当前真实执行器：本地 shard 通过 `executeQuery` 执行内部 query，远端 shard 通过 `ConnectionPoolWithFailover` 获取连接并用 `Connection::sendQuery` 发送 query，然后等待 `EndOfStream` 或远端 exception。
   - `DistributedShuffleJoinCoordinator` 当前实现 `prepareShuffleTables` 和 `cleanupShuffleTables`。
   - `prepareShuffleTables` 会向所有 shard 发送 left/right 两张 `_shuffle_*` `Memory` 表的 `CREATE TABLE`。
+  - `exchangeShuffleTables` 会在 `Prepare` 完成后对所有 source shard 调用 Exchange executor；Exchange 中途失败会立即 cleanup。
+  - `joinShuffleTables` 会在 `Exchange` 完成后对所有 target shard 调用 Local `JOIN` executor；Local `JOIN` 中途失败会立即 cleanup。
   - `cleanupShuffleTables` 会 best-effort 向所有 shard 发送 left/right 两张表的 `DROP TABLE IF EXISTS`，析构时也会触发清理。
   - 如果 prepare 中途抛 exception，会立即执行 cleanup 再继续抛出原 exception。
 - `src/Storages/DistributedShuffleJoinSink.h` 和 `src/Storages/DistributedShuffleJoinSink.cpp`：`DistributedShuffleJoinSink` 现在携带 `DistributedShuffleJoinTableNames`，并把表名上下文传给 `DistributedShuffleJoinBlockSender`。
   - 这样后续 remote sender 可以直接使用 side 对应的 `_shuffle_*` 表执行 `INSERT`。
   - 已删除 `source_shard_count`、`source_shard_index` 和 registry-style finish 语义；barrier 由 coordinator 等待所有 Exchange 请求返回来表达。
+- `src/Storages/DistributedShuffleJoinExchangePipeline.h` 和 `src/Storages/DistributedShuffleJoinExchangePipeline.cpp`：新增 Exchange side pipeline helper。
+  - `createDistributedShuffleJoinExchangeHeader` 根据 `DistributedShuffleJoinInfo` 和 side 生成 left/right shuffle 输入 header。
+  - `createDistributedShuffleJoinExchangeSourceQuery` 根据 required columns 和本地表名生成 source shard 本地读取 SQL。
+  - `createDistributedShuffleJoinExchangeSourceQuery` 也可以直接从 `DistributedShuffleJoinInfo` 中的 left/right `StorageDistributed` 取 remote database/table 来生成本地读取 SQL。
+  - `createDistributedShuffleJoinLocalJoinQuery` 根据 `_shuffle_*` 表名和 left/right key 列生成 target shard 上执行的本地 `INNER ALL JOIN` SQL。
+  - `createDistributedShuffleJoinRemoteExchangeQuery` 生成 initiator 后续可发给远端 source shard 的内部 `SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE ...` 命令。
+  - `createDistributedShuffleJoinExchangeSink` 根据 analyzer 输出、cluster、table names、side 和 sender 创建对应的 `DistributedShuffleJoinSink`。
+  - `executeDistributedShuffleJoinExchangeQuery` 会执行内部 source query，并把输出 pipeline 接到对应的 `DistributedShuffleJoinSink`。
+  - `executeDistributedShuffleJoinExchangeSide` 会从 analyzer 结果生成 side source query 并执行到对应 sink。
+  - `executeDistributedShuffleJoinExchangeSource` 会在 source shard 本地顺序执行 left/right 两侧 Exchange；任一侧失败会 cancel sender。
+  - `LocalDistributedShuffleJoinExchangeSideExecutor` 是 source shard 进程内的真实 side executor，内部复用 `executeDistributedShuffleJoinExchangeSide`。
+  - `CurrentShardDistributedShuffleJoinExchangeExecutor` 可以把 coordinator 的 Exchange executor 接口落到当前 shard 进程内执行；它既支持测试注入 fake side executor，也支持通过 `context`、`cluster`、analyzer info 和 sender 自己持有真实 `LocalDistributedShuffleJoinExchangeSideExecutor`。如果 coordinator 要它执行非当前 shard，会明确报 `NOT_IMPLEMENTED`，远端 source shard 触发仍是后续工作。
+  - `createCurrentShardDistributedShuffleJoinExchangeExecutor` 是当前 shard Exchange executor 的真实工厂，会创建 `ClusterDistributedShuffleJoinBlockSender` 并接上 `LocalDistributedShuffleJoinExchangeSideExecutor`。
+  - 这一步把 analyzer 输出、source query、selector、header 和 sink 串成稳定入口，后续 Exchange 请求处理可以按 left/right side 调用它。
+- `src/Parsers/ASTSystemQuery.h`、`src/Parsers/ASTSystemQuery.cpp`、`src/Parsers/ParserSystemQuery.cpp` 和 `src/Interpreters/InterpreterSystemQuery.cpp`：新增内部远端 Exchange 触发命令骨架。
+  - 新增 `SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE '<payload>'` 的 AST 类型、parser 和 formatter。
+  - 当前 interpreter 分支明确抛 `NOT_IMPLEMENTED`，还没有真正反序列化 payload 或执行远端 source Exchange。
+  - 这一步只是铺远端 source shard 触发通道，后续需要把 payload 设计成可恢复 `DistributedShuffleJoinInfo`、`_shuffle_*` 表名和 cluster 上下文的内部请求。
 - `src/Storages/DistributedShuffleJoinBlockSender.h` 和 `src/Storages/DistributedShuffleJoinBlockSender.cpp`：新增基于 cluster 的真实 table sender。
   - `ClusterDistributedShuffleJoinBlockSender` 以 `(target shard, side)` 为粒度复用 pushing pipeline。
   - target shard 是本地节点时，使用 `InterpreterInsertQuery` 构造本地 `INSERT INTO _shuffle_*` pipeline。
@@ -348,6 +368,12 @@ integration tests 至少覆盖：
 - `src/Core/Settings.cpp`：新增实验 setting `shuffle_exchange_timeout_ms`，默认 `300000`。
 - `src/Storages/tests/gtest_distributed_shuffle_join.cpp`：将本地闭环测试改为 table-sender 形态，并新增 coordinator 测试。
   - `CreatesMemoryTableNamesAndQueries` 验证 `_shuffle_*` 表名、`CREATE TABLE` 和 `DROP TABLE` SQL 生成。
+  - `CreatesLocalJoinQuery` 验证 target shard 本地 `JOIN` SQL 生成。
+  - `CreatesRemoteExchangeQuery` 验证远端 source Exchange 内部 `SYSTEM` 命令生成。
+  - `ParsesRemoteExchangeSystemQuery` 验证远端 source Exchange 内部 `SYSTEM` 命令可以解析并格式化回等价 SQL。
+  - `CurrentShardExchangeExecutorRunsSourceExchange` 验证当前 shard Exchange executor 会运行 left/right 两侧 source exchange。
+  - `CurrentShardExchangeExecutorRejectsRemoteShard` 验证当前 shard Exchange executor 不会假装支持远端 source shard 触发。
+  - `CurrentShardExchangeExecutorFactoryValidatesInputs` 验证当前 shard Exchange executor 工厂会拒绝缺失的 `context` / `cluster`。
   - `CoordinatorPreparesAndCleansMemoryTables` 验证 coordinator 会对每个 shard 发送 `CREATE TABLE` 和 `DROP TABLE`。
   - `CoordinatorCleansMemoryTablesAfterPrepareFailure` 验证 prepare 中途失败时会清理已创建的 shuffle 表。
 
@@ -374,11 +400,16 @@ integration tests 至少覆盖：
    - 已能生成 query/join 唯一的普通 `Memory` 表名，例如 `_shuffle_<query_id>_<join_id>_left` 和 `_shuffle_<query_id>_<join_id>_right`。
    - 已能根据 header 生成 `CREATE TABLE IF NOT EXISTS ... ENGINE = Memory`。
    - 已能生成 `DROP TABLE IF EXISTS ...`。
+   - 已能生成内部远端 Exchange 触发 SQL：`SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE '<payload>'`。
 
 4. `Prepare` 和 `Cleanup` coordinator
 
    - 已有 `DistributedShuffleJoinCoordinator`。
    - `prepareShuffleTables` 会向所有 shard 发送 left/right 两张 `_shuffle_*` 表的 `CREATE TABLE`。
+   - `exchangeShuffleTables` 会在 `Prepare` 后对所有 source shard 执行 Exchange executor，作为 `Exchange` 阶段的 coordinator 调度入口。
+   - 如果 `Exchange` 中途发生 exception，会先 cleanup 已创建的 `_shuffle_*` 表，再继续抛出原 exception。
+   - `joinShuffleTables` 会在 `Exchange` 后对所有 target shard 执行 Local `JOIN` SQL，作为 `Barrier -> Local JOIN` 阶段的 coordinator 调度入口。
+   - 如果 Local `JOIN` 中途发生 exception，会先 cleanup 已创建的 `_shuffle_*` 表，再继续抛出原 exception。
    - `cleanupShuffleTables` 会向所有 shard best-effort 发送 left/right 两张 `_shuffle_*` 表的 `DROP TABLE IF EXISTS`。
    - `DistributedShuffleJoinCoordinator` 析构时会触发清理。
    - 如果 `Prepare` 中途发生 exception，会先执行 cleanup，再继续抛出原 exception。
@@ -389,6 +420,7 @@ integration tests 至少覆盖：
    - 已有 `ClusterDistributedShuffleJoinQueryExecutor` 真实实现。
    - 本地 shard 使用 `executeQuery` 执行内部 query。
    - 远端 shard 使用 `ConnectionPoolWithFailover` 获取连接，再用 `Connection::sendQuery` 发送 query，并等待 `EndOfStream` 或远端 exception。
+   - `ClusterDistributedShuffleJoinQueryExecutor` 同时实现 Local `JOIN` executor 接口，Local `JOIN` 阶段可以复用同一套 shard SQL 执行逻辑。
 
 6. source 侧 block 分桶 sink
 
@@ -396,6 +428,10 @@ integration tests 至少覆盖：
    - sink 接收输入 `Block`，按 selector 计算每行目标 target shard。
    - sink 使用 `IColumn::scatter` 将 block 拆成多个目标 shard block。
    - sink 会把拆出来的 block 交给 `DistributedShuffleJoinBlockSender` 抽象。
+   - 已有 `DistributedShuffleJoinExchangePipeline` helper，可以根据 `DistributedShuffleJoinInfo` 为 left/right side 生成 source query、创建带正确 header/selector/table names 的 sink，也可以把内部 source query 的输出接到这个 sink 执行。
+   - 已有 source shard 本地 Exchange 封装：顺序执行 left/right 两侧，任一侧失败会 cancel sender，避免留下未收口的写入 pipeline。
+   - 已有 `CurrentShardDistributedShuffleJoinExchangeExecutor`，能把 coordinator 的 Exchange executor 接口连接到当前 shard 的 source-local Exchange 执行；真实工厂会创建 `ClusterDistributedShuffleJoinBlockSender` 并接上本地 side executor。远端 source shard 触发仍未实现，当前会明确报 `NOT_IMPLEMENTED`。
+   - 已有远端 source Exchange 内部 `SYSTEM` 命令的 parser/formatter/interpreter 骨架；interpreter 目前仍然 `NOT_IMPLEMENTED`，还没有执行 payload。
    - gtest 里仍保留 capturing fake，用来做纯分桶断言。
 
 7. 真实 table sender
@@ -409,8 +445,8 @@ integration tests 至少覆盖：
 8. 单测覆盖
 
    - 已有 `DistributedShuffleJoin.*` gtest。
-   - 当前覆盖 selector 分桶、从 analyzer info 创建 selector、`_shuffle_*` 表名和 SQL 生成、required columns 到 header 的转换、coordinator prepare/cleanup、prepare 失败清理。
-   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，7 个测试全部成功。
+   - 当前覆盖 selector 分桶、从 analyzer info 创建 selector、Exchange side sink 创建、Exchange source SQL 生成、缺失 source storage 保护、source shard left/right 执行顺序、source shard Exchange 失败 cancel、当前 shard Exchange executor、当前 shard Exchange executor 工厂校验、远端 Exchange 内部 `SYSTEM` 命令生成和解析、`_shuffle_*` 表名和 SQL 生成、Local `JOIN` SQL 生成、required columns 到 header 的转换、coordinator prepare/exchange/local join/cleanup、prepare 失败清理、Exchange 失败清理、Local `JOIN` 失败清理。
+   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，23 个测试全部成功。
 
 当前已实现能力对应的真实 SQL 例子：
 
@@ -565,6 +601,19 @@ SETTINGS distributed_shuffle_join = 1
 
    如果 `Prepare` 阶段中途发生 exception，也会尽力清理已经创建过的 `_shuffle_*` 表。
 
+7. 生成 target shard 上的本地 `JOIN` SQL
+
+   Exchange barrier 之后，当前 helper 已经能生成每个 target shard 上读取 `_shuffle_*` 表的本地 `JOIN` SQL：
+
+   ```sql
+   SELECT *
+   FROM default._shuffle_q123_0_left AS _shuffle_left
+   INNER ALL JOIN default._shuffle_q123_0_right AS _shuffle_right
+   ON _shuffle_left.id = _shuffle_right.id
+   ```
+
+   `DistributedShuffleJoinCoordinator::joinShuffleTables` 已经能在 `Exchange` 完成后把这条 SQL 下发到所有 shard。当前它仍是阶段骨架：还没有把结果 pipeline 接回 initiator 的真实 `SELECT` 输出。
+
 当前这个例子里还没实现的是中间最关键的完整执行链：
 
 ```text
@@ -589,6 +638,7 @@ SETTINGS distributed_shuffle_join = 1
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinAnalyzer.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Core/Settings.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinBlockSender.cpp.o`
+- `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinExchangePipeline.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Interpreters/DistributedShuffleJoinCoordinator.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSink.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSelector.cpp.o`
@@ -602,9 +652,9 @@ SETTINGS distributed_shuffle_join = 1
 
 当前代码还没有完成的部分：
 
-- `DistributedShuffleJoinSink` 的 selector 目前仍由外部传入，但已经可以根据 `DistributedShuffleJoinAnalyzer` 输出的 left/right key column 构造 selector。复杂表达式 key 尚未接入。
-- 已有 `ClusterDistributedShuffleJoinBlockSender`，但真实 Exchange 查询路径还没有实例化它，也还没有把 source shard 上的左右表扫描 pipeline 接到它。
-- coordinator 目前只完成 `Prepare` 和 `Cleanup`，并已有基于 `ConnectionPoolWithFailover` 的真实 query executor；但它还没有接入真实 distributed query path，也还没有实现 `Exchange -> Barrier -> Local JOIN`。
+- `DistributedShuffleJoinSink` 的 selector 目前仍由外部传入，但已经有 `DistributedShuffleJoinExchangePipeline` helper 可以根据 `DistributedShuffleJoinAnalyzer` 输出的 left/right key column、required columns 和 side 构造对应 sink。复杂表达式 key 尚未接入。
+- 已有 `ClusterDistributedShuffleJoinBlockSender` 和当前 shard Exchange executor；当前 shard 进程内已经能把 source side executor 接到 coordinator Exchange executor 接口，真实工厂也能把 sender 和本地 side executor 组装起来。远端 source shard 触发命令的 parser/formatter/interpreter 骨架已经存在，但 payload 反序列化和真正执行还没有实现。
+- coordinator 目前完成 `Prepare`、`Exchange` 调度入口、`Barrier -> Local JOIN` 调度入口和 `Cleanup`，并已有基于 `ConnectionPoolWithFailover` 的真实 query executor；但它还没有接入真实 distributed query path，也还没有把 Local `JOIN` 结果 pipeline 汇总回 initiator。
 - 还没有把 `_shuffle_*` 普通 `Memory` 表写入、查询、清理接入真实 distributed query path。
 - 尚未接入 `StorageDistributed::read`、`ClusterProxy::executeQuery` 或更合适的 planner 入口。
 - 尚未添加 integration tests。
@@ -612,7 +662,7 @@ SETTINGS distributed_shuffle_join = 1
 下一步建议：
 
 1. 实现 Exchange 请求处理：每个 source shard 读本地表一次，分别对 left/right 表构建 push pipeline，并实例化 `ClusterDistributedShuffleJoinBlockSender` 写入 shuffle 表。
-2. Exchange 全部成功后，下发读取 `_shuffle_*` 表的 local `JOIN` SQL，并在正常或异常退出时清理表。
+2. Exchange 全部成功后，把读取 `_shuffle_*` 表的 Local `JOIN` 结果 pipeline 接回 initiator，并在正常或异常退出时清理表。
 
 ### 未来产品化方向
 

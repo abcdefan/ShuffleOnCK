@@ -140,6 +140,7 @@ public:
         INSTRUMENT_ADD,
         INSTRUMENT_REMOVE,
         RESET_DDL_WORKER,
+        DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE,
         END
     };
 
@@ -202,6 +203,7 @@ public:
     String delta_kernel_tracing_level;
 
     String coverage_test_name;
+    String distributed_shuffle_join_exchange_payload;
 
     SyncReplicaMode sync_replica_mode = SyncReplicaMode::DEFAULT;
 
