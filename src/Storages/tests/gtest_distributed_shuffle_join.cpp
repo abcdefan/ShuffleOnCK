@@ -476,9 +476,83 @@ TEST(DistributedShuffleJoin, CreatesRemoteExchangeQuery)
     EXPECT_THROW(createDistributedShuffleJoinRemoteExchangeQuery(""), Exception);
 }
 
+TEST(DistributedShuffleJoin, SerializesAndParsesRemoteExchangePayload)
+{
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "shuffle db",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "payload-test", .join_id = 9});
+
+    DistributedShuffleJoinExchangePayload payload;
+    payload.cluster_name = "test_cluster";
+    payload.shard_count = 2;
+    payload.table_names = table_names;
+    payload.left_source = DistributedShuffleJoinExchangeSource{.database = "default", .table = "left local"};
+    payload.right_source = DistributedShuffleJoinExchangeSource{.database = "default", .table = "right local"};
+    payload.left_key_column_name = "left key";
+    payload.right_key_column_name = "right key";
+    payload.left_required_columns = {
+        {"left key", std::make_shared<DataTypeUInt64>()},
+        {"left value", std::make_shared<DataTypeUInt64>()},
+    };
+    payload.right_required_columns = {
+        {"right key", std::make_shared<DataTypeUInt64>()},
+        {"right value", std::make_shared<DataTypeUInt64>()},
+    };
+
+    const auto serialized = serializeDistributedShuffleJoinExchangePayload(payload);
+    const auto parsed = parseDistributedShuffleJoinExchangePayload(serialized);
+
+    EXPECT_EQ(parsed.cluster_name, payload.cluster_name);
+    EXPECT_EQ(parsed.shard_count, payload.shard_count);
+    EXPECT_EQ(parsed.table_names.database, payload.table_names.database);
+    EXPECT_EQ(parsed.table_names.left_table, payload.table_names.left_table);
+    EXPECT_EQ(parsed.table_names.right_table, payload.table_names.right_table);
+    EXPECT_EQ(parsed.left_source.database, payload.left_source.database);
+    EXPECT_EQ(parsed.left_source.table, payload.left_source.table);
+    EXPECT_EQ(parsed.right_source.database, payload.right_source.database);
+    EXPECT_EQ(parsed.right_source.table, payload.right_source.table);
+    EXPECT_EQ(parsed.left_key_column_name, payload.left_key_column_name);
+    EXPECT_EQ(parsed.right_key_column_name, payload.right_key_column_name);
+
+    ASSERT_EQ(parsed.left_required_columns.size(), 2);
+    EXPECT_EQ(parsed.left_required_columns[0].name, "left key");
+    EXPECT_EQ(parsed.left_required_columns[0].type->getName(), "UInt64");
+    EXPECT_EQ(parsed.left_required_columns[1].name, "left value");
+    EXPECT_EQ(parsed.left_required_columns[1].type->getName(), "UInt64");
+
+    ASSERT_EQ(parsed.right_required_columns.size(), 2);
+    EXPECT_EQ(parsed.right_required_columns[0].name, "right key");
+    EXPECT_EQ(parsed.right_required_columns[0].type->getName(), "UInt64");
+    EXPECT_EQ(parsed.right_required_columns[1].name, "right value");
+    EXPECT_EQ(parsed.right_required_columns[1].type->getName(), "UInt64");
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(parsed, DistributedShuffleJoinTableSide::Left),
+        "SELECT `left key`, `left value` FROM default.`left local`");
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(parsed, DistributedShuffleJoinTableSide::Right),
+        "SELECT `right key`, `right value` FROM default.`right local`");
+}
+
 TEST(DistributedShuffleJoin, ParsesRemoteExchangeSystemQuery)
 {
-    const auto query = createDistributedShuffleJoinRemoteExchangeQuery("query=q123;join=0");
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "system-payload-test", .join_id = 10});
+
+    DistributedShuffleJoinExchangePayload payload;
+    payload.cluster_name = "test_cluster";
+    payload.shard_count = 2;
+    payload.table_names = table_names;
+    payload.left_source = DistributedShuffleJoinExchangeSource{.database = "default", .table = "left_local"};
+    payload.right_source = DistributedShuffleJoinExchangeSource{.database = "default", .table = "right_local"};
+    payload.left_key_column_name = "id";
+    payload.right_key_column_name = "id";
+    payload.left_required_columns = {{"id", std::make_shared<DataTypeUInt64>()}};
+    payload.right_required_columns = {{"id", std::make_shared<DataTypeUInt64>()}};
+
+    const auto serialized_payload = serializeDistributedShuffleJoinExchangePayload(payload);
+    const auto query = createDistributedShuffleJoinRemoteExchangeQuery(serialized_payload);
 
     ParserSystemQuery parser;
     ASTPtr ast = parseQuery(parser, query.data(), query.data() + query.size(), "", 0, 0, 0);
@@ -486,8 +560,13 @@ TEST(DistributedShuffleJoin, ParsesRemoteExchangeSystemQuery)
     const auto * system_query = ast->as<ASTSystemQuery>();
     ASSERT_NE(system_query, nullptr);
     EXPECT_EQ(system_query->type, ASTSystemQuery::Type::DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE);
-    EXPECT_EQ(system_query->distributed_shuffle_join_exchange_payload, "query=q123;join=0");
+    EXPECT_EQ(system_query->distributed_shuffle_join_exchange_payload, serialized_payload);
     EXPECT_EQ(system_query->formatWithSecretsOneLine(), query);
+
+    const auto parsed = parseDistributedShuffleJoinExchangePayload(system_query->distributed_shuffle_join_exchange_payload);
+    EXPECT_EQ(parsed.cluster_name, payload.cluster_name);
+    EXPECT_EQ(parsed.table_names.left_table, payload.table_names.left_table);
+    EXPECT_EQ(parsed.left_source.table, payload.left_source.table);
 }
 
 TEST(DistributedShuffleJoin, ExchangeSourceRunsBothSides)
@@ -574,6 +653,19 @@ TEST(DistributedShuffleJoin, CurrentShardExchangeExecutorFactoryValidatesInputs)
             makeTwoShardCluster(),
             makeExchangeInfo()),
         Exception);
+}
+
+TEST(DistributedShuffleJoin, SystemQueryExchangeExecutorNeedsDistributedStorages)
+{
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "system-query-exchange-test", .join_id = 11});
+
+    RecordingShuffleQueryExecutor query_executor;
+    SystemQueryDistributedShuffleJoinExchangeExecutor exchange_executor(query_executor, makeExchangeInfo());
+
+    EXPECT_THROW(exchange_executor.executeOnShard(0, table_names), Exception);
+    EXPECT_TRUE(query_executor.getQueries().empty());
 }
 
 TEST(DistributedShuffleJoin, CreatesMemoryTableNamesAndQueries)

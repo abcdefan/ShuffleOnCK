@@ -54,6 +54,7 @@
 #include <Storages/ObjectStorage/HDFS/Configuration.h>
 #include <Storages/ObjectStorage/S3/Configuration.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/DistributedShuffleJoinExchangePipeline.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageFile.h>
@@ -1166,9 +1167,10 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->getDDLWorker().requestToResetState();
             break;
         case Type::DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE:
-            throw Exception(
-                ErrorCodes::NOT_IMPLEMENTED,
-                "Distributed `shuffle join` exchange request execution is not implemented yet");
+            executeDistributedShuffleJoinExchangePayload(
+                query.distributed_shuffle_join_exchange_payload,
+                getContext());
+            break;
         default:
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown type of SYSTEM query");
     }
