@@ -219,6 +219,7 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
     info.left_storage = left_storage;
     info.right_storage = right_storage;
     info.cluster_name = left_cluster->getName();
+    info.shuffle_database = left_storage->getStorageID().database_name;
     info.shard_count = left_cluster->getShardCount();
 
     bool keys_collected = false;

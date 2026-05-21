@@ -3,6 +3,8 @@
 #include <Core/Block.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/DistributedShuffleJoinCoordinator.h>
+#include <QueryPipeline/BlockIO.h>
+#include <QueryPipeline/QueryPlanResourceHolder.h>
 #include <Storages/DistributedShuffleJoinAnalyzer.h>
 #include <Storages/DistributedShuffleJoinSink.h>
 
@@ -12,6 +14,8 @@ namespace DB
 {
 
 class Cluster;
+class QueryPlan;
+class QueryPipeline;
 
 using ClusterPtr = std::shared_ptr<Cluster>;
 
@@ -32,6 +36,14 @@ struct DistributedShuffleJoinExchangePayload
     String right_key_column_name;
     NamesAndTypes left_required_columns;
     NamesAndTypes right_required_columns;
+};
+
+struct DistributedShuffleJoinExecutionPlan
+{
+    DistributedShuffleJoinTableNames table_names;
+    Block left_header;
+    Block right_header;
+    String local_join_query;
 };
 
 class IDistributedShuffleJoinExchangeSideExecutor
@@ -137,6 +149,19 @@ DistributedShuffleJoinInfo createDistributedShuffleJoinInfoFromExchangePayload(
 DistributedShuffleJoinExchangePayload createDistributedShuffleJoinExchangePayload(
     const DistributedShuffleJoinTableNames & table_names,
     const DistributedShuffleJoinInfo & info);
+DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
+    String shuffle_database,
+    DistributedShuffleJoinExchangeId exchange_id,
+    const DistributedShuffleJoinInfo & info);
+DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
+    String shuffle_database,
+    ContextPtr context,
+    size_t join_id,
+    const DistributedShuffleJoinInfo & info);
+DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
+    ContextPtr context,
+    size_t join_id,
+    const DistributedShuffleJoinInfo & info);
 
 std::shared_ptr<DistributedShuffleJoinSink> createDistributedShuffleJoinExchangeSink(
     ClusterPtr cluster,
@@ -167,5 +192,39 @@ void executeDistributedShuffleJoinExchangeSource(
 void executeDistributedShuffleJoinExchangePayload(
     String payload,
     ContextPtr context);
+std::unique_ptr<DistributedShuffleJoinCoordinator> prepareDistributedShuffleJoinExchange(
+    const DistributedShuffleJoinExecutionPlan & plan,
+    size_t shard_count,
+    IDistributedShuffleJoinQueryExecutor & query_executor,
+    IDistributedShuffleJoinExchangeExecutor & exchange_executor);
+QueryPlanResourceHolder holdDistributedShuffleJoinCoordinator(
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+void attachDistributedShuffleJoinCoordinator(
+    QueryPipeline & pipeline,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+BlockIO executeDistributedShuffleJoinLocalJoinPipeline(
+    const DistributedShuffleJoinExecutionPlan & plan,
+    ContextPtr context,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+void buildDistributedShuffleJoinClusterLocalJoinQueryPlan(
+    QueryPlan & query_plan,
+    const DistributedShuffleJoinExecutionPlan & plan,
+    ContextPtr context,
+    ClusterPtr cluster);
+BlockIO executeDistributedShuffleJoinClusterLocalJoinPipeline(
+    const DistributedShuffleJoinExecutionPlan & plan,
+    ContextPtr context,
+    ClusterPtr cluster,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+void executeDistributedShuffleJoinLocalJoinAndCleanup(
+    DistributedShuffleJoinCoordinator & coordinator,
+    const DistributedShuffleJoinExecutionPlan & plan,
+    IDistributedShuffleJoinLocalJoinExecutor & local_join_executor);
+void executeDistributedShuffleJoinStages(
+    const DistributedShuffleJoinExecutionPlan & plan,
+    size_t shard_count,
+    IDistributedShuffleJoinQueryExecutor & query_executor,
+    IDistributedShuffleJoinExchangeExecutor & exchange_executor,
+    IDistributedShuffleJoinLocalJoinExecutor & local_join_executor);
 
 }

@@ -29,6 +29,7 @@ struct DistributedShuffleJoinInfo
     NamesAndTypes right_required_columns;
 
     String cluster_name;
+    String shuffle_database;
     size_t shard_count = 0;
 };
 
