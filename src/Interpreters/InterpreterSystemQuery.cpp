@@ -176,6 +176,20 @@ namespace ActionLocks
 namespace
 {
 
+void checkDistributedShuffleJoinExchangeIsInternal(ContextPtr context)
+{
+    const auto & client_info = context->getClientInfo();
+    if (context->isInternalQuery()
+        || (client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY && client_info.distributed_depth > 0))
+    {
+        return;
+    }
+
+    throw Exception(
+        ErrorCodes::ACCESS_DENIED,
+        "`SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE` is an internal distributed `shuffle join` command");
+}
+
 /// Sequentially tries to execute all commands and throws exception with info about failed commands
 void executeCommandsAndThrowIfError(std::vector<std::function<void()>> commands)
 {
@@ -1167,6 +1181,7 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->getDDLWorker().requestToResetState();
             break;
         case Type::DISTRIBUTED_SHUFFLE_JOIN_EXCHANGE:
+            checkDistributedShuffleJoinExchangeIsInternal(getContext());
             executeDistributedShuffleJoinExchangePayload(
                 query.distributed_shuffle_join_exchange_payload,
                 getContext());

@@ -6,11 +6,14 @@
 
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
+#include <Common/tests/gtest_global_context.h>
 #include <Core/Block.h>
 #include <Core/Settings.h>
 #include <Interpreters/DistributedShuffleJoinCoordinator.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/Cluster.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/InterpreterSystemQuery.h>
 #include <Parsers/ASTSystemQuery.h>
 #include <Parsers/ParserSystemQuery.h>
 #include <Parsers/parseQuery.h>
@@ -469,6 +472,35 @@ TEST(DistributedShuffleJoin, CreatesLocalJoinQuery)
         "ON _shuffle_left.`left key` = _shuffle_right.`right key`");
 }
 
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithProjection)
+{
+    auto info = makeExchangeInfo();
+    info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"left value", std::make_shared<DataTypeUInt64>()},
+    };
+    info.right_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"right value", std::make_shared<DataTypeUInt64>()},
+    };
+    info.projection_columns = {
+        DistributedShuffleJoinProjectionColumn{.is_left = true, .source_column_name = "id", .result_column_name = "id"},
+        DistributedShuffleJoinProjectionColumn{.is_left = true, .source_column_name = "left value", .result_column_name = "value"},
+        DistributedShuffleJoinProjectionColumn{.is_left = false, .source_column_name = "right value", .result_column_name = "right value"},
+    };
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-join-projection-test", .join_id = 20});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(table_names, info),
+        "SELECT _shuffle_left.id AS id, _shuffle_left.`left value` AS value, _shuffle_right.`right value` AS `right value` "
+        "FROM default._shuffle_local_join_projection_test_20_left AS _shuffle_left "
+        "INNER ALL JOIN default._shuffle_local_join_projection_test_20_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+}
+
 TEST(DistributedShuffleJoin, CreatesExecutionPlan)
 {
     auto info = makeExchangeInfo();
@@ -499,6 +531,18 @@ TEST(DistributedShuffleJoin, CreatesExecutionPlan)
         "SELECT * FROM `shuffle db`._shuffle_execution_plan_test_12_left AS _shuffle_left "
         "INNER ALL JOIN `shuffle db`._shuffle_execution_plan_test_12_right AS _shuffle_right "
         "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, ExecutionPlanUsesUniqueFallbackQueryId)
+{
+    auto context = Context::createCopy(getContext().context);
+    context->makeQueryContext();
+
+    const auto plan = createDistributedShuffleJoinExecutionPlan(context, 7, makeExchangeInfo());
+
+    EXPECT_TRUE(plan.table_names.left_table.starts_with("_shuffle_distributed_shuffle_join_"));
+    EXPECT_TRUE(plan.table_names.left_table.ends_with("_7_left"));
+    EXPECT_NE(plan.table_names.left_table, "_shuffle_distributed_shuffle_join_7_left");
 }
 
 TEST(DistributedShuffleJoin, CreatesRemoteExchangeQuery)
@@ -601,6 +645,17 @@ TEST(DistributedShuffleJoin, ParsesRemoteExchangeSystemQuery)
     EXPECT_EQ(parsed.cluster_name, payload.cluster_name);
     EXPECT_EQ(parsed.table_names.left_table, payload.table_names.left_table);
     EXPECT_EQ(parsed.left_source.table, payload.left_source.table);
+}
+
+TEST(DistributedShuffleJoin, RemoteExchangeSystemQueryRejectsUserQuery)
+{
+    const String query = "SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE 'payload'";
+
+    ParserSystemQuery parser;
+    ASTPtr ast = parseQuery(parser, query.data(), query.data() + query.size(), "", 0, 0, 0);
+
+    auto context = Context::createCopy(getContext().context);
+    EXPECT_THROW(InterpreterSystemQuery(ast, context).execute(), Exception);
 }
 
 TEST(DistributedShuffleJoin, ExchangeSourceRunsBothSides)
@@ -891,6 +946,35 @@ TEST(DistributedShuffleJoin, CoordinatorResourceCleansTablesOnDestruction)
     EXPECT_THROW(holdDistributedShuffleJoinCoordinator(nullptr), Exception);
 }
 
+TEST(DistributedShuffleJoin, OwnedCoordinatorResourceValidatesInputs)
+{
+    const auto plan = createDistributedShuffleJoinExecutionPlan(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "owned-coordinator-resource-test", .join_id = 19},
+        makeExchangeInfo());
+
+    auto query_executor = std::make_unique<RecordingShuffleQueryExecutor>();
+    auto coordinator = std::make_unique<DistributedShuffleJoinCoordinator>(
+        plan.table_names,
+        plan.left_header,
+        plan.right_header,
+        2,
+        *query_executor);
+
+    EXPECT_THROW(
+        holdDistributedShuffleJoinCoordinator(
+            nullptr,
+            std::move(coordinator)),
+        Exception);
+
+    query_executor = std::make_unique<RecordingShuffleQueryExecutor>();
+    EXPECT_THROW(
+        holdDistributedShuffleJoinCoordinator(
+            std::move(query_executor),
+            nullptr),
+        Exception);
+}
+
 TEST(DistributedShuffleJoin, AttachedCoordinatorResourceCleansTablesWithPipeline)
 {
     const auto plan = createDistributedShuffleJoinExecutionPlan(
@@ -989,6 +1073,16 @@ TEST(DistributedShuffleJoin, ClusterLocalJoinPipelineFailureCleansCoordinator)
     EXPECT_EQ(query_executor.getQueries()[5].query, drop_left);
     EXPECT_EQ(query_executor.getQueries()[6].query, drop_right);
     EXPECT_EQ(query_executor.getQueries()[7].query, drop_right);
+}
+
+TEST(DistributedShuffleJoin, FullPipelineEntryValidatesInputs)
+{
+    EXPECT_THROW(
+        executeDistributedShuffleJoinPipeline(
+            makeExchangeInfo(),
+            nullptr,
+            0),
+        Exception);
 }
 
 TEST(DistributedShuffleJoin, CoordinatorCleansMemoryTablesAfterPrepareFailure)

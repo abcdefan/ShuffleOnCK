@@ -52,6 +52,7 @@ private:
 
     ClusterPtr cluster;
     ContextPtr context;
+    String base_query_id;
     UInt64 query_index = 0;
 };
 

@@ -18,6 +18,8 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 
 #include <Storages/IStorage.h>
+#include <Storages/DistributedShuffleJoinAnalyzer.h>
+#include <Storages/DistributedShuffleJoinExchangePipeline.h>
 
 #include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/QueryTreePassManager.h>
@@ -49,6 +51,7 @@ namespace Setting
 extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
 extern const SettingsUInt64 automatic_parallel_replicas_mode;
 extern const SettingsParallelReplicasMode parallel_replicas_mode;
+extern const SettingsBool distributed_shuffle_join;
 extern const SettingsBool use_concurrency_control;
 extern const SettingsBool parallel_replicas_local_plan;
 extern const SettingsString cluster_for_parallel_replicas;
@@ -343,6 +346,18 @@ std::pair<SharedHeader, PlannerContextPtr> InterpreterSelectQueryAnalyzer::getSa
 
 BlockIO InterpreterSelectQueryAnalyzer::execute()
 {
+    if (context->getSettingsRef()[Setting::distributed_shuffle_join] && select_query_options.to_stage == QueryProcessingStage::Complete)
+    {
+        if (auto shuffle_join_info = tryAnalyzeDistributedShuffleJoin(query_tree, context))
+        {
+            auto result = executeDistributedShuffleJoinPipeline(*shuffle_join_info, context, 0);
+            if (!select_query_options.ignore_quota)
+                result.pipeline.setQuota(context->getQuota());
+
+            return result;
+        }
+    }
+
     auto pipeline_builder = buildQueryPipeline();
 
     BlockIO result;

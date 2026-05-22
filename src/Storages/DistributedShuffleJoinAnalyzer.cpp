@@ -7,6 +7,7 @@
 #include <Analyzer/ListNode.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/TableNode.h>
+#include <Analyzer/UnionNode.h>
 #include <Analyzer/Utils.h>
 #include <Common/typeid_cast.h>
 #include <Storages/StorageDistributed.h>
@@ -18,6 +19,52 @@ namespace DB
 
 namespace
 {
+
+const QueryNode * getSingleSelectQueryNode(const QueryTreeNodePtr & query_tree)
+{
+    if (!query_tree)
+        return nullptr;
+
+    if (const auto * query_node = query_tree->as<QueryNode>())
+        return query_node;
+
+    const auto * union_node = query_tree->as<UnionNode>();
+    if (!union_node)
+        return nullptr;
+
+    const auto & queries = union_node->getQueries().getNodes();
+    if (queries.size() != 1)
+        return nullptr;
+
+    return queries.front()->as<QueryNode>();
+}
+
+bool hasUnsupportedSelectClauses(const QueryNode & query_node)
+{
+    return query_node.hasWith()
+        || query_node.isDistinct()
+        || query_node.hasPrewhere()
+        || query_node.hasWhere()
+        || query_node.hasGroupBy()
+        || query_node.isGroupByWithTotals()
+        || query_node.isGroupByWithRollup()
+        || query_node.isGroupByWithCube()
+        || query_node.isGroupByWithGroupingSets()
+        || query_node.isGroupByAll()
+        || query_node.hasHaving()
+        || query_node.hasWindow()
+        || query_node.hasQualify()
+        || query_node.hasOrderBy()
+        || query_node.isOrderByAll()
+        || query_node.hasInterpolate()
+        || query_node.hasLimitByLimit()
+        || query_node.hasLimitByOffset()
+        || query_node.hasLimitBy()
+        || query_node.isLimitByAll()
+        || query_node.hasLimit()
+        || query_node.hasOffset()
+        || query_node.isLimitWithTies();
+}
 
 class CollectColumnSourceToColumnsVisitor : public InDepthQueryTreeVisitor<CollectColumnSourceToColumnsVisitor>
 {
@@ -152,6 +199,43 @@ void collectRequiredColumns(DistributedShuffleJoinInfo & info, QueryTreeNodePtr 
         info.right_required_columns = right_columns_it->second.columns;
 }
 
+bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode & query_node)
+{
+    const auto & projection_nodes = query_node.getProjection().getNodes();
+    const auto & projection_columns = query_node.getProjectionColumns();
+
+    if (projection_nodes.size() != projection_columns.size())
+        return false;
+
+    info.projection_columns.clear();
+    info.projection_columns.reserve(projection_nodes.size());
+
+    for (size_t i = 0; i < projection_nodes.size(); ++i)
+    {
+        const auto * column_node = projection_nodes[i]->as<ColumnNode>();
+        if (!column_node)
+            return false;
+
+        auto column_source = column_node->getColumnSourceOrNull();
+        if (!column_source)
+            return false;
+
+        const bool is_left = column_source->isEqual(*info.left_table_expression);
+        const bool is_right = column_source->isEqual(*info.right_table_expression);
+        if (!is_left && !is_right)
+            return false;
+
+        info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn
+        {
+            .is_left = is_left,
+            .source_column_name = column_node->getColumnName(),
+            .result_column_name = projection_columns[i].name,
+        });
+    }
+
+    return true;
+}
+
 void addRequiredColumnIfMissing(NamesAndTypes & required_columns, NameAndTypePair column)
 {
     for (const auto & required_column : required_columns)
@@ -176,8 +260,11 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
     const QueryTreeNodePtr & query_tree,
     ContextPtr)
 {
-    const auto * query_node = query_tree ? query_tree->as<QueryNode>() : nullptr;
+    const auto * query_node = getSingleSelectQueryNode(query_tree);
     if (!query_node)
+        return {};
+
+    if (hasUnsupportedSelectClauses(*query_node))
         return {};
 
     const auto * join_node = query_node->getJoinTree()->as<JoinNode>();
@@ -233,6 +320,10 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
 
     collectRequiredColumns(info, query_tree);
     ensureKeyColumnsAreRequired(info);
+
+    if (!collectProjectionColumns(info, *query_node))
+        return {};
+
     return info;
 }
 

@@ -199,8 +199,15 @@ std::unique_ptr<DistributedShuffleJoinCoordinator> prepareDistributedShuffleJoin
     IDistributedShuffleJoinExchangeExecutor & exchange_executor);
 QueryPlanResourceHolder holdDistributedShuffleJoinCoordinator(
     std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+QueryPlanResourceHolder holdDistributedShuffleJoinCoordinator(
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
 void attachDistributedShuffleJoinCoordinator(
     QueryPipeline & pipeline,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+void attachDistributedShuffleJoinCoordinator(
+    QueryPipeline & pipeline,
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor,
     std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
 BlockIO executeDistributedShuffleJoinLocalJoinPipeline(
     const DistributedShuffleJoinExecutionPlan & plan,
@@ -216,6 +223,16 @@ BlockIO executeDistributedShuffleJoinClusterLocalJoinPipeline(
     ContextPtr context,
     ClusterPtr cluster,
     std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+BlockIO executeDistributedShuffleJoinClusterLocalJoinPipeline(
+    const DistributedShuffleJoinExecutionPlan & plan,
+    ContextPtr context,
+    ClusterPtr cluster,
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
+BlockIO executeDistributedShuffleJoinPipeline(
+    const DistributedShuffleJoinInfo & info,
+    ContextPtr context,
+    size_t join_id);
 void executeDistributedShuffleJoinLocalJoinAndCleanup(
     DistributedShuffleJoinCoordinator & coordinator,
     const DistributedShuffleJoinExecutionPlan & plan,

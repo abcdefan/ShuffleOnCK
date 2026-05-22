@@ -6,11 +6,19 @@
 #include <base/types.h>
 
 #include <optional>
+#include <vector>
 
 namespace DB
 {
 
 class StorageDistributed;
+
+struct DistributedShuffleJoinProjectionColumn
+{
+    bool is_left = false;
+    String source_column_name;
+    String result_column_name;
+};
 
 struct DistributedShuffleJoinInfo
 {
@@ -27,6 +35,7 @@ struct DistributedShuffleJoinInfo
 
     NamesAndTypes left_required_columns;
     NamesAndTypes right_required_columns;
+    std::vector<DistributedShuffleJoinProjectionColumn> projection_columns;
 
     String cluster_name;
     String shuffle_database;

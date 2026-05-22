@@ -4,6 +4,7 @@
 #include <Common/logger_useful.h>
 #include <Common/quoteString.h>
 #include <Core/Field.h>
+#include <Core/UUID.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Cluster.h>
@@ -116,6 +117,32 @@ String formatColumnList(const NamesAndTypes & columns)
             result += ", ";
 
         result += backQuoteIfNeed(column.name);
+    }
+
+    return result;
+}
+
+String formatLocalJoinProjectionList(const DistributedShuffleJoinInfo & info)
+{
+    if (info.projection_columns.empty())
+        return "*";
+
+    String result;
+    for (const auto & column : info.projection_columns)
+    {
+        if (column.source_column_name.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` projection source column cannot be empty");
+
+        if (column.result_column_name.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` projection result column cannot be empty");
+
+        if (!result.empty())
+            result += ", ";
+
+        result += column.is_left ? "_shuffle_left." : "_shuffle_right.";
+        result += backQuoteIfNeed(column.source_column_name);
+        result += " AS ";
+        result += backQuoteIfNeed(column.result_column_name);
     }
 
     return result;
@@ -277,7 +304,7 @@ String getShuffleJoinInitialQueryId(ContextPtr context)
 
     auto query_id = context->getCurrentQueryId();
     if (query_id.empty())
-        query_id = "distributed_shuffle_join";
+        query_id = fmt::format("distributed_shuffle_join_{}", UUIDHelpers::generateV4());
 
     return query_id;
 }
@@ -288,6 +315,7 @@ ContextMutablePtr createDistributedShuffleJoinLocalJoinContext(ContextPtr contex
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` local join cannot be executed without context");
 
     auto query_context = Context::createCopy(context);
+    query_context->setInternalQuery(true);
 
     /// This helper owns a simple generated `SELECT` over ordinary `Memory` tables. Using the AST path keeps
     /// `ClusterProxy::executeQuery` independent from analyzer query-tree plumbing until the full SELECT path is integrated.
@@ -323,7 +351,27 @@ public:
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` coordinator resource cannot be created without coordinator");
     }
 
+    DistributedShuffleJoinCoordinatorResource(
+        std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor_,
+        std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator_)
+        : query_executor(std::move(query_executor_))
+        , coordinator(std::move(coordinator_))
+    {
+        if (!query_executor)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` coordinator resource cannot be created without query executor");
+
+        if (!coordinator)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` coordinator resource cannot be created without coordinator");
+    }
+
 private:
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor;
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator;
+};
+
+struct DistributedShuffleJoinExecutionLifetime
+{
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor;
     std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator;
 };
 
@@ -506,7 +554,8 @@ String createDistributedShuffleJoinLocalJoinQuery(
     validateExchangeInfo(info, DistributedShuffleJoinTableSide::Right);
 
     return fmt::format(
-        "SELECT * FROM {} AS _shuffle_left INNER ALL JOIN {} AS _shuffle_right ON _shuffle_left.{} = _shuffle_right.{}",
+        "SELECT {} FROM {} AS _shuffle_left INNER ALL JOIN {} AS _shuffle_right ON _shuffle_left.{} = _shuffle_right.{}",
+        formatLocalJoinProjectionList(info),
         table_names.getQualifiedTableName(DistributedShuffleJoinTableSide::Left),
         table_names.getQualifiedTableName(DistributedShuffleJoinTableSide::Right),
         backQuoteIfNeed(info.left_key_column_name),
@@ -711,6 +760,7 @@ void executeDistributedShuffleJoinExchangeQuery(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` exchange query cannot be executed without context");
 
     auto query_context = Context::createCopy(context);
+    query_context->setInternalQuery(true);
     auto block_io = executeQuery(std::move(query), query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete).second;
     block_io.pipeline.complete(createDistributedShuffleJoinExchangeSink(
         std::move(cluster),
@@ -845,11 +895,32 @@ QueryPlanResourceHolder holdDistributedShuffleJoinCoordinator(
     return holder;
 }
 
+QueryPlanResourceHolder holdDistributedShuffleJoinCoordinator(
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator)
+{
+    QueryPlanResourceHolder holder;
+    holder.custom_resources.push_back(std::make_shared<DistributedShuffleJoinCoordinatorResource>(
+        std::move(query_executor),
+        std::move(coordinator)));
+    return holder;
+}
+
 void attachDistributedShuffleJoinCoordinator(
     QueryPipeline & pipeline,
     std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator)
 {
     pipeline.addResources(holdDistributedShuffleJoinCoordinator(std::move(coordinator)));
+}
+
+void attachDistributedShuffleJoinCoordinator(
+    QueryPipeline & pipeline,
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator)
+{
+    pipeline.addResources(holdDistributedShuffleJoinCoordinator(
+        std::move(query_executor),
+        std::move(coordinator)));
 }
 
 BlockIO executeDistributedShuffleJoinLocalJoinPipeline(
@@ -874,6 +945,42 @@ BlockIO executeDistributedShuffleJoinLocalJoinPipeline(
         QueryProcessingStage::Complete).second;
 
     attachDistributedShuffleJoinCoordinator(block_io.pipeline, std::move(coordinator));
+    return block_io;
+}
+
+BlockIO executeDistributedShuffleJoinClusterLocalJoinPipeline(
+    const DistributedShuffleJoinExecutionPlan & plan,
+    ContextPtr context,
+    ClusterPtr cluster,
+    std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor,
+    std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator)
+{
+    if (!query_executor)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` local join pipeline cannot be created without query executor");
+
+    if (!coordinator)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` local join pipeline cannot be created without coordinator");
+
+    DistributedShuffleJoinExecutionLifetime lifetime
+    {
+        .query_executor = std::move(query_executor),
+        .coordinator = std::move(coordinator),
+    };
+
+    auto query_context = createDistributedShuffleJoinLocalJoinContext(context);
+    QueryPlan query_plan;
+    buildDistributedShuffleJoinClusterLocalJoinQueryPlan(query_plan, plan, query_context, std::move(cluster));
+
+    auto builder = query_plan.buildQueryPipeline(
+        QueryPlanOptimizationSettings(query_context),
+        BuildQueryPipelineSettings(query_context));
+
+    BlockIO block_io;
+    block_io.pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
+    attachDistributedShuffleJoinCoordinator(
+        block_io.pipeline,
+        std::move(lifetime.query_executor),
+        std::move(lifetime.coordinator));
     return block_io;
 }
 
@@ -949,6 +1056,38 @@ BlockIO executeDistributedShuffleJoinClusterLocalJoinPipeline(
     block_io.pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
     attachDistributedShuffleJoinCoordinator(block_io.pipeline, std::move(coordinator));
     return block_io;
+}
+
+BlockIO executeDistributedShuffleJoinPipeline(
+    const DistributedShuffleJoinInfo & info,
+    ContextPtr context,
+    size_t join_id)
+{
+    if (!context)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` pipeline cannot be created without context");
+
+    if (!info.left_storage)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` pipeline cannot be created without left distributed storage");
+
+    auto cluster = info.left_storage->getCluster();
+    if (!cluster)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` pipeline cannot be created without cluster");
+
+    auto plan = createDistributedShuffleJoinExecutionPlan(context, join_id, info);
+    auto query_executor = std::make_unique<ClusterDistributedShuffleJoinQueryExecutor>(cluster, context);
+    SystemQueryDistributedShuffleJoinExchangeExecutor exchange_executor(*query_executor, info);
+    auto coordinator = prepareDistributedShuffleJoinExchange(
+        plan,
+        info.shard_count,
+        *query_executor,
+        exchange_executor);
+
+    return executeDistributedShuffleJoinClusterLocalJoinPipeline(
+        plan,
+        std::move(context),
+        std::move(cluster),
+        std::move(query_executor),
+        std::move(coordinator));
 }
 
 void executeDistributedShuffleJoinLocalJoinAndCleanup(

@@ -9,6 +9,8 @@
 #include <Core/Protocol.h>
 #include <Core/QueryProcessingStage.h>
 #include <Core/Settings.h>
+#include <Core/UUID.h>
+#include <Interpreters/ClientInfo.h>
 #include <IO/ConnectionTimeouts.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
@@ -40,6 +42,10 @@ ClusterDistributedShuffleJoinQueryExecutor::ClusterDistributedShuffleJoinQueryEx
 
     if (cluster->getShardCount() == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` query executor cannot be created with empty cluster");
+
+    base_query_id = context->getCurrentQueryId();
+    if (base_query_id.empty())
+        base_query_id = fmt::format("distributed_shuffle_join_{}", UUIDHelpers::generateV4());
 }
 
 void ClusterDistributedShuffleJoinQueryExecutor::executeOnShard(size_t shard_index, const String & query)
@@ -62,10 +68,6 @@ void ClusterDistributedShuffleJoinQueryExecutor::executeOnShard(size_t shard_ind
 
 String ClusterDistributedShuffleJoinQueryExecutor::makeQueryId(size_t shard_index)
 {
-    auto base_query_id = context->getCurrentQueryId();
-    if (base_query_id.empty())
-        base_query_id = "distributed_shuffle_join";
-
     return fmt::format("{}:shuffle:{}:{}", base_query_id, shard_index, query_index++);
 }
 
@@ -73,6 +75,7 @@ void ClusterDistributedShuffleJoinQueryExecutor::executeLocal(const String & que
 {
     auto query_context = Context::createCopy(context);
     query_context->setCurrentQueryId(makeQueryId(shard_index));
+    query_context->setInternalQuery(true);
 
     auto block_io = executeQuery(query, query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete).second;
     executeTrivialBlockIO(block_io, query_context);
@@ -92,6 +95,9 @@ void ClusterDistributedShuffleJoinQueryExecutor::executeRemote(const String & qu
     const auto & settings = context->getSettingsRef();
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(settings);
     auto connection = shard_info.pool->get(timeouts, settings, true);
+    auto client_info = context->getClientInfo();
+    client_info.query_kind = ClientInfo::QueryKind::SECONDARY_QUERY;
+    ++client_info.distributed_depth;
 
     connection->sendQuery(
         timeouts,
@@ -100,7 +106,7 @@ void ClusterDistributedShuffleJoinQueryExecutor::executeRemote(const String & qu
         makeQueryId(shard_index),
         QueryProcessingStage::Complete,
         &settings,
-        &context->getClientInfo(),
+        &client_info,
         false,
         {},
         {});
