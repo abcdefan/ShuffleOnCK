@@ -235,6 +235,13 @@ def prefetch_images(
         print("No images to pre-fetch.")
         return True
 
+    if os.environ.get("CLICKHOUSE_TESTS_SKIP_DOCKER_PULL") == "1":
+        print(
+            "Skip pre-fetching Docker images because "
+            "CLICKHOUSE_TESTS_SKIP_DOCKER_PULL=1"
+        )
+        return True
+
     script = f"{repo_dir}/ci/jobs/scripts/prefetch-integration-test-images"
     env = {
         **os.environ,
@@ -246,6 +253,15 @@ def prefetch_images(
         verbose=True,
         env=env,
     )
+
+
+def load_local_docker_image_tar() -> None:
+    image_tar = os.environ.get("CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR", "")
+    if not image_tar:
+        return
+
+    print(f"Loading Docker image tar [{image_tar}]")
+    Shell.check(f"docker load -i {image_tar}", verbose=True, strict=True)
 
 
 def parse_args():
@@ -771,6 +787,8 @@ tar -czf ./ci/tmp/logs.tar.gz \
     # Pre-fetch all Docker images needed by the selected test suites.
     # This is done after IMAGES_ENV vars are set so tag resolution works correctly.
     # Fail fast here rather than discovering missing images mid-test-run.
+    load_local_docker_image_tar()
+
     all_test_modules = parallel_test_modules + sequential_test_modules
     compose_files = get_compose_files_for_test_modules(all_test_modules)
     print(

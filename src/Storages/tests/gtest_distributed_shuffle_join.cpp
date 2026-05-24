@@ -20,6 +20,9 @@
 #include <Processors/Chunk.h>
 #include <QueryPipeline/QueryPipeline.h>
 
+#include <Poco/AutoPtr.h>
+#include <Poco/Util/MapConfiguration.h>
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -56,12 +59,13 @@ Chunk makeChunk(const std::vector<UInt64> & ids)
     return Chunk(block.getColumns(), block.rows());
 }
 
-ClusterPtr makeTwoShardCluster()
+ClusterPtr makeCluster(
+    const String & cluster_name,
+    const std::vector<std::vector<String>> & shard_names)
 {
     static const String username = "default";
     static const String password;
     static const String bind_host;
-    static const String cluster_name = "distributed_shuffle_join_test";
     static const String cluster_secret;
 
     Settings settings;
@@ -79,12 +83,41 @@ ClusterPtr makeTwoShardCluster()
 
     return std::make_shared<Cluster>(
         settings,
-        std::vector<std::vector<String>>
+        shard_names,
+        params);
+}
+
+ClusterPtr makeTwoShardCluster()
+{
+    return makeCluster(
+        "distributed_shuffle_join_test",
         {
             {"127.0.0.1:9000"},
             {"127.0.0.2:9000"},
-        },
-        params);
+        });
+}
+
+ClusterPtr makeConfiguredCluster(
+    const String & cluster_name,
+    const std::vector<std::vector<String>> & shard_names)
+{
+    Settings settings;
+    Poco::AutoPtr<Poco::Util::MapConfiguration> config = new Poco::Util::MapConfiguration;
+
+    const String cluster_prefix = "remote_servers." + cluster_name;
+    for (size_t shard_index = 0; shard_index < shard_names.size(); ++shard_index)
+    {
+        const String shard_prefix = cluster_prefix + ".shard" + std::to_string(shard_index + 1);
+        for (size_t replica_index = 0; replica_index < shard_names[shard_index].size(); ++replica_index)
+        {
+            const auto [host, port] = Cluster::Address::fromString(shard_names[shard_index][replica_index]);
+            const String replica_prefix = shard_prefix + ".replica" + std::to_string(replica_index + 1);
+            config->setString(replica_prefix + ".host", host);
+            config->setString(replica_prefix + ".port", std::to_string(port));
+        }
+    }
+
+    return std::make_shared<Cluster>(*config, settings, "remote_servers", cluster_name);
 }
 
 std::vector<UInt64> collectIds(const std::vector<Block> & blocks)
@@ -381,6 +414,54 @@ TEST(DistributedShuffleJoin, SinkPartitionsBlocksForShuffleTables)
     EXPECT_FALSE(sender->wasCancelled());
 }
 
+TEST(DistributedShuffleJoin, ClusterLayoutEligibilityMatchesMvpScope)
+{
+    auto supported_left = makeConfiguredCluster(
+        "distributed_shuffle_join_test",
+        {
+            {"127.0.0.1:9000"},
+            {"127.0.0.2:9000"},
+        });
+    auto supported_right = makeConfiguredCluster(
+        "distributed_shuffle_join_test",
+        {
+            {"127.0.0.1:9000"},
+            {"127.0.0.2:9000"},
+        });
+    EXPECT_TRUE(isDistributedShuffleJoinClusterLayoutSupported(*supported_left, *supported_right));
+
+    auto different_cluster = makeConfiguredCluster(
+        "another_distributed_shuffle_join_test",
+        {
+            {"127.0.0.1:9000"},
+            {"127.0.0.2:9000"},
+        });
+    EXPECT_FALSE(isDistributedShuffleJoinClusterLayoutSupported(*supported_left, *different_cluster));
+
+    auto anonymous_cluster = makeCluster(
+        "",
+        {
+            {"127.0.0.1:9000"},
+            {"127.0.0.2:9000"},
+        });
+    EXPECT_FALSE(isDistributedShuffleJoinClusterLayoutSupported(*anonymous_cluster, *anonymous_cluster));
+
+    auto one_shard_cluster = makeConfiguredCluster(
+        "distributed_shuffle_join_test",
+        {
+            {"127.0.0.1:9000"},
+        });
+    EXPECT_FALSE(isDistributedShuffleJoinClusterLayoutSupported(*supported_left, *one_shard_cluster));
+
+    auto multi_replica_cluster = makeConfiguredCluster(
+        "distributed_shuffle_join_test",
+        {
+            {"127.0.0.1:9000", "127.0.0.3:9000"},
+            {"127.0.0.2:9000"},
+        });
+    EXPECT_FALSE(isDistributedShuffleJoinClusterLayoutSupported(*multi_replica_cluster, *supported_right));
+}
+
 TEST(DistributedShuffleJoin, ExchangeSinkUsesAnalyzerInfo)
 {
     const auto info = makeExchangeInfo();
@@ -442,6 +523,33 @@ TEST(DistributedShuffleJoin, CreatesExchangeSourceQuery)
             info,
             DistributedShuffleJoinTableSide::Left),
         "SELECT id, value FROM default.`left local`");
+}
+
+TEST(DistributedShuffleJoin, CreatesExchangeSourceQueryWithSideFilter)
+{
+    auto info = makeExchangeInfo();
+    info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"value", std::make_shared<DataTypeUInt64>()},
+    };
+    info.left_filter_condition = "(id >= 10) AND (value < 20)";
+    info.right_filter_condition = "id != 0";
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(
+            "default",
+            "left local",
+            info,
+            DistributedShuffleJoinTableSide::Left),
+        "SELECT id, value FROM default.`left local` WHERE (id >= 10) AND (value < 20)");
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(
+            "default",
+            "right local",
+            info,
+            DistributedShuffleJoinTableSide::Right),
+        "SELECT id FROM default.`right local` WHERE id != 0");
 }
 
 TEST(DistributedShuffleJoin, ExchangeSourceQueryNeedsDistributedStorage)
@@ -576,6 +684,8 @@ TEST(DistributedShuffleJoin, SerializesAndParsesRemoteExchangePayload)
         {"right key", std::make_shared<DataTypeUInt64>()},
         {"right value", std::make_shared<DataTypeUInt64>()},
     };
+    payload.left_filter_condition = "`left value` > 10";
+    payload.right_filter_condition = "`right value` < 20";
 
     const auto serialized = serializeDistributedShuffleJoinExchangePayload(payload);
     const auto parsed = parseDistributedShuffleJoinExchangePayload(serialized);
@@ -591,6 +701,8 @@ TEST(DistributedShuffleJoin, SerializesAndParsesRemoteExchangePayload)
     EXPECT_EQ(parsed.right_source.table, payload.right_source.table);
     EXPECT_EQ(parsed.left_key_column_name, payload.left_key_column_name);
     EXPECT_EQ(parsed.right_key_column_name, payload.right_key_column_name);
+    EXPECT_EQ(parsed.left_filter_condition, payload.left_filter_condition);
+    EXPECT_EQ(parsed.right_filter_condition, payload.right_filter_condition);
 
     ASSERT_EQ(parsed.left_required_columns.size(), 2);
     EXPECT_EQ(parsed.left_required_columns[0].name, "left key");
@@ -606,10 +718,10 @@ TEST(DistributedShuffleJoin, SerializesAndParsesRemoteExchangePayload)
 
     EXPECT_EQ(
         createDistributedShuffleJoinExchangeSourceQuery(parsed, DistributedShuffleJoinTableSide::Left),
-        "SELECT `left key`, `left value` FROM default.`left local`");
+        "SELECT `left key`, `left value` FROM default.`left local` WHERE `left value` > 10");
     EXPECT_EQ(
         createDistributedShuffleJoinExchangeSourceQuery(parsed, DistributedShuffleJoinTableSide::Right),
-        "SELECT `right key`, `right value` FROM default.`right local`");
+        "SELECT `right key`, `right value` FROM default.`right local` WHERE `right value` < 20");
 }
 
 TEST(DistributedShuffleJoin, ParsesRemoteExchangeSystemQuery)

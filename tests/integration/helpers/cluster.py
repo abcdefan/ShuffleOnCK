@@ -3463,16 +3463,21 @@ class ClickHouseCluster:
 
             common_opts = ["--verbose", "up", "-d"]
 
-            images_pull_cmd = self.base_cmd + ["pull"]
-            # sometimes dockerhub/proxy can be flaky
+            if os.environ.get("CLICKHOUSE_TESTS_SKIP_DOCKER_PULL") == "1":
+                logging.info(
+                    "Skipping Docker image pull because CLICKHOUSE_TESTS_SKIP_DOCKER_PULL=1"
+                )
+            else:
+                images_pull_cmd = self.base_cmd + ["pull"]
+                # sometimes dockerhub/proxy can be flaky
 
-            def logging_pulling_images(**kwargs):
-                if "exception" in kwargs:
-                    logging.info(
-                        "Got exception pulling images: %s", kwargs["exception"]
-                    )
+                def logging_pulling_images(**kwargs):
+                    if "exception" in kwargs:
+                        logging.info(
+                            "Got exception pulling images: %s", kwargs["exception"]
+                        )
 
-            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=180)
+                retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=180)
 
             def logging_compose_up(**kwargs):
                 if "exception" in kwargs:
@@ -3952,6 +3957,8 @@ class ClickHouseCluster:
                 self.wait_arrowflight_to_start()
 
             clickhouse_start_cmd = self.base_cmd + ["up", "-d", "--no-recreate"]
+            if os.environ.get("CLICKHOUSE_TESTS_SKIP_DOCKER_PULL") == "1":
+                clickhouse_start_cmd += ["--pull", "never"]
             logging.debug(
                 (
                     "Trying to create ClickHouse instance by command %s",

@@ -72,3 +72,21 @@ def test_inner_all_join_uses_push_based_shuffle(started_cluster):
         "4\tl4_node2\tr4_node1",
     ]
     assert_no_shuffle_tables()
+
+
+def test_inner_all_join_pushes_single_side_where_filters(started_cluster):
+    query = """
+        SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        WHERE l.id >= 2 AND r.id <= 3
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    result = node1.query(query)
+
+    assert sorted_tsv(result) == [
+        "2\tl2_node1\tr2_node2",
+        "3\tl3_node2\tr3_node1",
+    ]
+    assert_no_shuffle_tables()

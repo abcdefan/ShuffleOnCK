@@ -403,6 +403,8 @@ integration tests 至少覆盖：
    - 已有实验 setting `distributed_shuffle_join`，默认关闭。
    - 已有 `DistributedShuffleJoinAnalyzer`，用于判断 MVP 查询是否能走 `shuffle join`：目前目标是 `enable_analyzer = 1`、左右都是直接 `StorageDistributed`、同 cluster、简单等值 `INNER ALL JOIN`。
    - analyzer 已经提取 left/right 直接 key 列名；`ON` 形态目前收窄为左右两侧直接列等值条件，复杂表达式 key 仍不走 MVP 路径。
+   - analyzer 现在会保守拒绝 `enable_parallel_replicas` 已开启、匿名/非具名 cluster、左右 shard 数不一致、或任意 shard 含多个 replica 的场景，避免 MVP 路径误处理 parallel replicas / replica 选择语义。
+   - analyzer 现在支持有限的 `WHERE` 下推：`AND` 拆分后的每个 deterministic 子条件必须只引用左表或右表一侧；左表条件进入 left source query，右表条件进入 right source query。跨左右表的 post-join filter、非 deterministic 条件和复杂来源仍然保守拒绝。
    - analyzer 目前只做资格判断和信息提取，不会自动改写 query，也不会启动执行。
 
 2. 分桶 selector
@@ -453,7 +455,7 @@ integration tests 至少覆盖：
    - 已有 `DistributedShuffleJoinExecutionPlan`，可以把 analyzer 输出稳定转换为 `_shuffle_*` 表名、left/right header 和 target shard 本地 `JOIN` SQL。
    - analyzer 现在能接受直接 `QueryNode`，也能接受 analyzer 为普通单条 `SELECT` 包出来的单 query `UnionNode`；多 query `UNION` 仍然不会走 MVP 路径。
    - analyzer 输出现在包含简单直接列 projection；本地 `JOIN` SQL 会按用户原始输出列生成 `SELECT` 列表，而不是固定 `SELECT *`。如果 projection 里出现表达式、聚合或其它非直接列，analyzer 会保守拒绝 MVP 路径。
-   - analyzer 现在会保守拒绝尚未实现语义的 query clauses，包括 `WITH`、`DISTINCT`、`PREWHERE`、`WHERE`、`GROUP BY`、`HAVING`、window/`QUALIFY`、`ORDER BY`、`LIMIT BY`、`LIMIT`、`OFFSET` 等，避免真实 hook 改变用户查询结果。
+   - analyzer 现在会保守拒绝尚未实现语义的 query clauses，包括 `WITH`、`DISTINCT`、`PREWHERE`、`GROUP BY`、`HAVING`、window/`QUALIFY`、`ORDER BY`、`LIMIT BY`、`LIMIT`、`OFFSET` 等，避免真实 hook 改变用户查询结果。
    - 已有 `executeDistributedShuffleJoinStages`，可以把 execution plan、query executor、Exchange executor 和 Local `JOIN` executor 串成 `Prepare -> Exchange -> Local JOIN -> Cleanup` 阶段调用。
    - 已有 `prepareDistributedShuffleJoinExchange`，可以把 `Prepare -> Exchange` 和结果读取生命周期分开，避免真实 `SELECT` 返回结果前过早 cleanup。
    - 已有 `holdDistributedShuffleJoinCoordinator` 和 `attachDistributedShuffleJoinCoordinator`，可以把 cleanup 生命周期挂到 `QueryPlanResourceHolder` 或直接 attach 到结果 `QueryPipeline`；真实 pipeline 路径还可以同时持有 owned query executor，避免 cleanup 时 coordinator 引用的 executor 提前析构。
@@ -462,7 +464,8 @@ integration tests 至少覆盖：
    - 已有 `executeDistributedShuffleJoinClusterLocalJoinPipeline`，可以把所有 target shard 的 `_shuffle_*` 本地 `JOIN` 结果汇总成 result `BlockIO`，并把 coordinator cleanup 生命周期挂到结果 pipeline 上。
    - 已有 `executeDistributedShuffleJoinPipeline`，可以从 `DistributedShuffleJoinInfo` 和 `Context` 直接执行完整 `Prepare -> Exchange -> cluster Local JOIN result pipeline`，并把 query executor/coordinator 生命周期挂到结果 pipeline 上。
    - 已有 `DistributedShuffleJoinExchangePipeline` helper，可以根据 `DistributedShuffleJoinInfo` 为 left/right side 生成 source query、创建带正确 header/selector/table names 的 sink，也可以把内部 source query 的输出接到这个 sink 执行。
-   - 已有远端 source Exchange JSON payload helpers，可以序列化/反序列化 cluster、source 表、`_shuffle_*` 表名、key 和 columns，并从 payload 还原执行 Exchange 所需的 `DistributedShuffleJoinInfo`。
+   - Exchange source query 会把 analyzer 得到的 left/right filter condition 拼到对应本地 source SQL 的 `WHERE`，从发送端提前减少 shuffle 数据。
+   - 已有远端 source Exchange JSON payload helpers，可以序列化/反序列化 cluster、source 表、`_shuffle_*` 表名、key、columns 和 left/right filter condition，并从 payload 还原执行 Exchange 所需的 `DistributedShuffleJoinInfo`。
    - 已有 source shard 本地 Exchange 封装：顺序执行 left/right 两侧，任一侧失败会 cancel sender，避免留下未收口的写入 pipeline。
    - 已有 `CurrentShardDistributedShuffleJoinExchangeExecutor`，能把 coordinator 的 Exchange executor 接口连接到当前 shard 的 source-local Exchange 执行；真实工厂会创建 `ClusterDistributedShuffleJoinBlockSender` 并接上本地 side executor。
    - 已有远端 source Exchange 内部 `SYSTEM` 命令的 parser/formatter/interpreter 入口；interpreter 会解析 payload，并在收到请求的 shard 上执行 left/right source Exchange；该入口已限制为 internal query 或带 `distributed_depth` 的 `SECONDARY_QUERY`。
@@ -481,10 +484,12 @@ integration tests 至少覆盖：
 8. 测试覆盖
 
    - 已有 `DistributedShuffleJoin.*` gtest。
-   - 当前覆盖 selector 分桶、从 analyzer info 创建 selector、Exchange side sink 创建、Exchange source SQL 生成、缺失 source storage 保护、远端 Exchange payload 序列化/反序列化、执行计划生成、query id 缺失时的唯一 fallback 表名前缀、完整阶段顺序执行、`Prepare -> Exchange` 生命周期拆分、coordinator resource 析构 cleanup、owned query executor/coordinator resource 输入保护、coordinator resource attach 到 `QueryPipeline` 后 cleanup、Local `JOIN` pipeline 失败 cleanup、cluster Local `JOIN` pipeline 失败 cleanup、完整 pipeline 入口输入保护、source shard left/right 执行顺序、source shard Exchange 失败 cancel、当前 shard Exchange executor、system-query Exchange executor 保护、当前 shard Exchange executor 工厂校验、远端 Exchange 内部 `SYSTEM` 命令生成和解析、普通用户直接执行内部 `SYSTEM` 命令会被拒绝、`_shuffle_*` 表名和 SQL 生成、带 projection 的 Local `JOIN` SQL 生成、required columns 到 header 的转换、coordinator prepare/exchange/local join/cleanup、prepare 失败清理、Exchange 失败清理、Local `JOIN` 失败清理。
-   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，37 个测试全部成功。
-   - 已新增 `tests/integration/test_distributed_shuffle_join`，用两个 shard 的真实 `Distributed` 表跑 `INNER ALL JOIN`，数据故意不按 `JOIN` key 落位，并在查询后检查 `_shuffle_*` 表已清理。
-   - 当前本地尚未跑通 integration：`python3 -m ci.praktika run "integration" --test test_distributed_shuffle_join` 被已有 `ci/tmp/environment.json` 权限挡住；直接 `python3 -m pytest` 又缺少本地 `pytest` 模块。
+   - 当前覆盖 selector 分桶、从 analyzer info 创建 selector、cluster layout MVP 边界判断、Exchange side sink 创建、Exchange source SQL 生成、Exchange source `WHERE` 下推、缺失 source storage 保护、远端 Exchange payload 序列化/反序列化、执行计划生成、query id 缺失时的唯一 fallback 表名前缀、完整阶段顺序执行、`Prepare -> Exchange` 生命周期拆分、coordinator resource 析构 cleanup、owned query executor/coordinator resource 输入保护、coordinator resource attach 到 `QueryPipeline` 后 cleanup、Local `JOIN` pipeline 失败 cleanup、cluster Local `JOIN` pipeline 失败 cleanup、完整 pipeline 入口输入保护、source shard left/right 执行顺序、source shard Exchange 失败 cancel、当前 shard Exchange executor、system-query Exchange executor 保护、当前 shard Exchange executor 工厂校验、远端 Exchange 内部 `SYSTEM` 命令生成和解析、普通用户直接执行内部 `SYSTEM` 命令会被拒绝、`_shuffle_*` 表名和 SQL 生成、带 projection 的 Local `JOIN` SQL 生成、required columns 到 header 的转换、coordinator prepare/exchange/local join/cleanup、prepare 失败清理、Exchange 失败清理、Local `JOIN` 失败清理。
+   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，39 个测试全部成功。
+   - 已新增 `tests/integration/test_distributed_shuffle_join`，用两个 shard 的真实 `Distributed` 表跑 `INNER ALL JOIN`，数据故意不按 `JOIN` key 落位，并在查询后检查 `_shuffle_*` 表已清理；其中也覆盖 `WHERE l.id >= 2 AND r.id <= 3` 这类可下推到单表 source 的过滤。
+   - 当前本地已经用 integration helper 生成的 compose 文件和本地已有 `clickhouse/integration-test:5bb2dd37392781717bda` 镜像手动跑通两节点 demo：普通 `INNER ALL JOIN` 返回 4 行正确结果，带 `WHERE l.id >= 2 AND r.id <= 3` 的查询返回 2 行正确结果，两个节点查询后都没有残留 `_shuffle_*` 表。
+   - 当前本地已经跑通完整 Praktika integration job。由于本机默认 `ci/tmp` 是旧 Docker 产物且 Docker Hub 拉取超时，本地运行时使用 `/usr/bin/python3` 临时覆盖 `Settings.TEMP_DIR=./tmp/praktika`，并通过 `CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR` 将宿主机已有的 `clickhouse/integration-test:5bb2dd37392781717bda` 镜像导入 Praktika 的 Docker-in-Docker 环境；`test_distributed_shuffle_join` 两个 pytest 用例全部通过。
+   - `ci/jobs/integration_test_job.py` 和 `tests/integration/helpers/cluster.py` 新增默认关闭的本地测试开关：`CLICKHOUSE_TESTS_SKIP_DOCKER_PULL=1` 时跳过 integration image prefetch 和 per-cluster `docker compose pull`，ClickHouse cluster `compose up` 会带 `--pull never`；`CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR=<path>` 时 Praktika job 会先执行 `docker load -i <path>`。CI 默认行为不变。
 
 当前已实现能力对应的真实 SQL 例子：
 
@@ -683,6 +688,7 @@ SETTINGS distributed_shuffle_join = 1
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSink.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinSelector.cpp.o`
 - `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinTables.cpp.o`
+- `ninja -C build src/CMakeFiles/dbms.dir/Storages/DistributedShuffleJoinAnalyzer.cpp.o`
 - `ninja -C build src/CMakeFiles/unit_tests_dbms.dir/Storages/tests/gtest_distributed_shuffle_join.cpp.o`
 - `ninja -C build unit_tests_dbms`
 
@@ -690,19 +696,24 @@ SETTINGS distributed_shuffle_join = 1
 
 - `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'`
 - `env PYTHONPYCACHEPREFIX=tmp/pycache python3 -m py_compile tests/integration/test_distributed_shuffle_join/test.py`
+- `python3 -m ci.praktika run "integration" --test test_distributed_shuffle_join` 当前仍因 `./ci/tmp/environment.json` 权限失败，日志见 `build/test_integration_distributed_shuffle_join_where_pushdown.log`。
+- `env PYTHONPYCACHEPREFIX=tmp/pycache python3 -m pytest tests/integration/test_distributed_shuffle_join` 当前仍因本地缺少 `pytest` 模块失败，日志见 `build/test_pytest_distributed_shuffle_join_where_pushdown.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 后运行 Praktika integration，可以进入 pytest，但因为 Docker Hub 拉取 `clickhouse/integration-test` 超时被标记为 infrastructure error，日志见 `build/test_integration_distributed_shuffle_join_praktika_escalated.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR`，并通过 `--param CLICKHOUSE_TESTS_SKIP_DOCKER_PULL=1,CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR=tmp/docker_images/clickhouse_integration_test_5bb2dd37392781717bda.tar` 运行 Praktika integration，已通过，日志见 `build/test_integration_distributed_shuffle_join_praktika_load_image.log`。
+- 手动使用 `tests/integration/test_distributed_shuffle_join/_instances-gw0` 下的 compose 文件和 `--pull never` 启动本地已有镜像，执行 integration 中同样的建表、插入、`distributed_shuffle_join = 1` 查询和 cleanup 检查已通过，日志见 `build/manual_distributed_shuffle_join_query.log`、`build/manual_distributed_shuffle_join_where_query.log`、`build/manual_distributed_shuffle_join_node1_shuffle_tables.log` 和 `build/manual_distributed_shuffle_join_node2_shuffle_tables.log`。
 
 当前代码还没有完成的部分：
 
 - `DistributedShuffleJoinSink` 的 selector 目前仍由外部传入，但已经有 `DistributedShuffleJoinExchangePipeline` helper 可以根据 `DistributedShuffleJoinAnalyzer` 输出的 left/right key column、required columns 和 side 构造对应 sink。复杂表达式 key 尚未接入。
 - 已有 `ClusterDistributedShuffleJoinBlockSender`、当前 shard Exchange executor、远端 `SYSTEM` payload 执行入口、system-query Exchange executor、完整阶段编排 helper、可延后 cleanup 的 `Prepare -> Exchange` helper，以及 pipeline resource holder；当前 shard 进程内已经能把 source side executor 接到 coordinator Exchange executor 接口，收到远端 `SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE ...` 的 shard 也能解析 payload 并执行本地 left/right source Exchange。`executeDistributedShuffleJoinPipeline` 已经把这些组件串成真实 `SELECT` hook 使用的完整入口，内部 `SYSTEM` 入口也已限制为 internal query 或带 `distributed_depth` 的 `SECONDARY_QUERY`。
 - coordinator 目前完成 `Prepare`、`Exchange` 调度入口、`Barrier -> Local JOIN` result pipeline 和 `Cleanup`，并已有基于 `ConnectionPoolWithFailover` 的真实 query executor。
-- 已在 `InterpreterSelectQueryAnalyzer::execute` 接入真实 distributed query path 的 MVP hook，但还没在本地成功跑完 end-to-end integration test 验证真实多 shard server 场景。
-- 当前只覆盖简单直接列 projection；表达式、聚合、`WHERE` 下推、post-join filter、排序和 limit 等语义会被 analyzer 保守拒绝，尚未接入。
+- 已在 `InterpreterSelectQueryAnalyzer::execute` 接入真实 distributed query path 的 MVP hook，并已手动跑通真实两节点 server demo；完整 Praktika integration job 也已通过。
+- 当前只覆盖简单直接列 projection 和可下推到单表 source 的 deterministic `WHERE` 子条件；表达式 projection、聚合、post-join filter、排序和 limit 等语义会被 analyzer 保守拒绝，尚未接入。
 
 下一步建议：
 
-1. 在具备可写 `ci/tmp` 和 `pytest` 的环境里跑 `python3 -m ci.praktika run "integration" --test test_distributed_shuffle_join`，验证新增 integration test。
-2. 后续逐步放开 query 形态：先做单表 `WHERE` 下推和 post-join filter，再考虑排序、limit、表达式 projection 和聚合。
+1. 后续逐步放开 query 形态：先做 post-join filter，再考虑排序、limit、表达式 projection 和聚合。
+2. 继续补负向/回退测试：`distributed_shuffle_join = 0` 不改变原路径、不支持的 query 形态回退普通 planner、异常路径 cleanup。
 
 ### 未来产品化方向
 

@@ -36,6 +36,8 @@ struct DistributedShuffleJoinExchangePayload
     String right_key_column_name;
     NamesAndTypes left_required_columns;
     NamesAndTypes right_required_columns;
+    String left_filter_condition;
+    String right_filter_condition;
 };
 
 struct DistributedShuffleJoinExecutionPlan

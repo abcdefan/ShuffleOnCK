@@ -1,6 +1,7 @@
 #include <Storages/DistributedShuffleJoinAnalyzer.h>
 
 #include <Analyzer/ColumnNode.h>
+#include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/JoinNode.h>
@@ -10,12 +11,20 @@
 #include <Analyzer/UnionNode.h>
 #include <Analyzer/Utils.h>
 #include <Common/typeid_cast.h>
+#include <Core/Settings.h>
+#include <Interpreters/Cluster.h>
+#include <Interpreters/Context.h>
 #include <Storages/StorageDistributed.h>
 
 #include <unordered_map>
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
+}
 
 namespace
 {
@@ -44,7 +53,6 @@ bool hasUnsupportedSelectClauses(const QueryNode & query_node)
     return query_node.hasWith()
         || query_node.isDistinct()
         || query_node.hasPrewhere()
-        || query_node.hasWhere()
         || query_node.hasGroupBy()
         || query_node.isGroupByWithTotals()
         || query_node.isGroupByWithRollup()
@@ -236,6 +244,104 @@ bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode
     return true;
 }
 
+void collectWhereConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
+{
+    const auto * function_node = node->as<FunctionNode>();
+    if (function_node && function_node->getFunctionName() == "and")
+    {
+        for (const auto & argument : function_node->getArguments().getNodes())
+            collectWhereConjuncts(argument, conjuncts);
+
+        return;
+    }
+
+    conjuncts.push_back(node);
+}
+
+bool isDeterministicFilterExpression(const QueryTreeNodePtr & node)
+{
+    if (node->as<ColumnNode>())
+        return true;
+
+    if (const auto * constant_node = node->as<ConstantNode>())
+        return constant_node->isDeterministic();
+
+    if (const auto * function_node = node->as<FunctionNode>())
+    {
+        auto function = function_node->getFunction();
+        if (!function || !function->isDeterministicInScopeOfQuery())
+            return false;
+
+        for (const auto & argument : function_node->getArguments().getNodes())
+            if (!isDeterministicFilterExpression(argument))
+                return false;
+
+        return true;
+    }
+
+    return false;
+}
+
+String formatFilterCondition(const QueryTreeNodePtr & node)
+{
+    ConvertToASTOptions options;
+    options.fully_qualified_identifiers = false;
+    return node->toAST(options)->formatWithSecretsOneLine();
+}
+
+String combineFilterConditions(const std::vector<String> & conditions)
+{
+    String result;
+    for (const auto & condition : conditions)
+    {
+        if (condition.empty())
+            return {};
+
+        if (!result.empty())
+            result += " AND ";
+
+        result += "(";
+        result += condition;
+        result += ")";
+    }
+
+    return result;
+}
+
+bool collectWhereFilters(DistributedShuffleJoinInfo & info, const QueryNode & query_node)
+{
+    if (!query_node.hasWhere())
+        return true;
+
+    QueryTreeNodes conjuncts;
+    collectWhereConjuncts(query_node.getWhere(), conjuncts);
+
+    std::vector<String> left_conditions;
+    std::vector<String> right_conditions;
+
+    for (const auto & conjunct : conjuncts)
+    {
+        if (!isDeterministicFilterExpression(conjunct))
+            return false;
+
+        auto [source, is_valid_source] = getExpressionSource(conjunct);
+        if (!is_valid_source)
+            return false;
+
+        auto filter_condition = formatFilterCondition(conjunct);
+        if (!source || source->isEqual(*info.left_table_expression))
+            left_conditions.push_back(std::move(filter_condition));
+        else if (source->isEqual(*info.right_table_expression))
+            right_conditions.push_back(std::move(filter_condition));
+        else
+            return false;
+    }
+
+    info.left_filter_condition = combineFilterConditions(left_conditions);
+    info.right_filter_condition = combineFilterConditions(right_conditions);
+    return true;
+}
+
 void addRequiredColumnIfMissing(NamesAndTypes & required_columns, NameAndTypePair column)
 {
     for (const auto & required_column : required_columns)
@@ -254,12 +360,40 @@ void ensureKeyColumnsAreRequired(DistributedShuffleJoinInfo & info)
         addRequiredColumnIfMissing(info.right_required_columns, right_key_column->getColumn());
 }
 
+bool hasOneReplicaPerShard(const Cluster & cluster)
+{
+    for (const auto & shard_info : cluster.getShardsInfo())
+        if (shard_info.getAllNodeCount() != 1)
+            return false;
+
+    return true;
+}
+
+}
+
+bool isDistributedShuffleJoinClusterLayoutSupported(
+    const Cluster & left_cluster,
+    const Cluster & right_cluster)
+{
+    if (left_cluster.getName().empty() || left_cluster.getName() != right_cluster.getName())
+        return false;
+
+    if (left_cluster.getShardCount() < 2 || left_cluster.getShardCount() != right_cluster.getShardCount())
+        return false;
+
+    return hasOneReplicaPerShard(left_cluster) && hasOneReplicaPerShard(right_cluster);
 }
 
 std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
     const QueryTreeNodePtr & query_tree,
-    ContextPtr)
+    ContextPtr context)
 {
+    if (!context)
+        return {};
+
+    if (context->getSettingsRef()[Setting::allow_experimental_parallel_reading_from_replicas] > 0)
+        return {};
+
     const auto * query_node = getSingleSelectQueryNode(query_tree);
     if (!query_node)
         return {};
@@ -294,10 +428,7 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
     if (!left_cluster || !right_cluster)
         return {};
 
-    if (left_cluster->getName() != right_cluster->getName())
-        return {};
-
-    if (left_cluster->getShardCount() < 2)
+    if (!isDistributedShuffleJoinClusterLayoutSupported(*left_cluster, *right_cluster))
         return {};
 
     DistributedShuffleJoinInfo info;
@@ -320,6 +451,9 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
 
     collectRequiredColumns(info, query_tree);
     ensureKeyColumnsAreRequired(info);
+
+    if (!collectWhereFilters(info, *query_node))
+        return {};
 
     if (!collectProjectionColumns(info, *query_node))
         return {};

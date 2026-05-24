@@ -11,6 +11,7 @@
 namespace DB
 {
 
+class Cluster;
 class StorageDistributed;
 
 struct DistributedShuffleJoinProjectionColumn
@@ -36,6 +37,8 @@ struct DistributedShuffleJoinInfo
     NamesAndTypes left_required_columns;
     NamesAndTypes right_required_columns;
     std::vector<DistributedShuffleJoinProjectionColumn> projection_columns;
+    String left_filter_condition;
+    String right_filter_condition;
 
     String cluster_name;
     String shuffle_database;
@@ -47,5 +50,11 @@ struct DistributedShuffleJoinInfo
 std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
     const QueryTreeNodePtr & query_tree,
     ContextPtr context);
+
+/// Return true if both sides use a cluster layout supported by the first
+/// distributed `shuffle join` MVP.
+bool isDistributedShuffleJoinClusterLayoutSupported(
+    const Cluster & left_cluster,
+    const Cluster & right_cluster);
 
 }

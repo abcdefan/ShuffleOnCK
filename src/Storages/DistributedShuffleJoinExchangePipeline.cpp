@@ -70,6 +70,16 @@ const NamesAndTypes & getRequiredColumns(
     return info.right_required_columns;
 }
 
+const String & getFilterCondition(
+    const DistributedShuffleJoinInfo & info,
+    DistributedShuffleJoinTableSide side)
+{
+    if (side == DistributedShuffleJoinTableSide::Left)
+        return info.left_filter_condition;
+
+    return info.right_filter_condition;
+}
+
 const StorageDistributed * getSourceStorage(
     const DistributedShuffleJoinInfo & info,
     DistributedShuffleJoinTableSide side)
@@ -514,11 +524,17 @@ String createDistributedShuffleJoinExchangeSourceQuery(
     if (table.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` exchange source table cannot be empty");
 
-    return fmt::format(
+    auto query = fmt::format(
         "SELECT {} FROM {}.{}",
         formatColumnList(getRequiredColumns(info, side)),
         backQuoteIfNeed(database),
         backQuoteIfNeed(table));
+
+    const auto & filter_condition = getFilterCondition(info, side);
+    if (!filter_condition.empty())
+        query += " WHERE " + filter_condition;
+
+    return query;
 }
 
 String createDistributedShuffleJoinExchangeSourceQuery(
@@ -589,6 +605,8 @@ String serializeDistributedShuffleJoinExchangePayload(const DistributedShuffleJo
     object->set("right_key", payload.right_key_column_name);
     object->set("left_columns", serializeColumns(payload.left_required_columns));
     object->set("right_columns", serializeColumns(payload.right_required_columns));
+    object->set("left_filter", payload.left_filter_condition);
+    object->set("right_filter", payload.right_filter_condition);
 
     std::ostringstream out;
     Poco::JSON::Stringifier::stringify(object, out);
@@ -619,6 +637,10 @@ DistributedShuffleJoinExchangePayload parseDistributedShuffleJoinExchangePayload
     result.right_key_column_name = object->getValue<String>("right_key");
     result.left_required_columns = parseColumns(object->getObject("left_columns"), "left");
     result.right_required_columns = parseColumns(object->getObject("right_columns"), "right");
+    if (object->has("left_filter"))
+        result.left_filter_condition = object->getValue<String>("left_filter");
+    if (object->has("right_filter"))
+        result.right_filter_condition = object->getValue<String>("right_filter");
 
     validatePayload(result);
     return result;
@@ -637,6 +659,8 @@ DistributedShuffleJoinInfo createDistributedShuffleJoinInfoFromExchangePayload(
     info.right_key_column_name = payload.right_key_column_name;
     info.left_required_columns = payload.left_required_columns;
     info.right_required_columns = payload.right_required_columns;
+    info.left_filter_condition = payload.left_filter_condition;
+    info.right_filter_condition = payload.right_filter_condition;
     return info;
 }
 
@@ -665,6 +689,8 @@ DistributedShuffleJoinExchangePayload createDistributedShuffleJoinExchangePayloa
     payload.right_key_column_name = info.right_key_column_name;
     payload.left_required_columns = info.left_required_columns;
     payload.right_required_columns = info.right_required_columns;
+    payload.left_filter_condition = info.left_filter_condition;
+    payload.right_filter_condition = info.right_filter_condition;
 
     validatePayload(payload);
     return payload;
