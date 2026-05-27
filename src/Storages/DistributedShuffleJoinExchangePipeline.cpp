@@ -5,22 +5,28 @@
 #include <Common/quoteString.h>
 #include <Core/Field.h>
 #include <Core/UUID.h>
+#include <Databases/IDatabase.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
 #include <Interpreters/ClusterProxy/executeQuery.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/InterpreterDropQuery.h>
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/SelectQueryOptions.h>
 #include <Interpreters/StorageID.h>
 #include <Interpreters/executeQuery.h>
+#include <Parsers/ASTDropQuery.h>
 #include <Parsers/ParserSelectQuery.h>
 #include <Parsers/parseQuery.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/LimitStep.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/SortingStep.h>
 #include <QueryPipeline/QueryPipeline.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/Distributed/DistributedSettings.h>
@@ -28,6 +34,7 @@
 #include <Storages/DistributedShuffleJoinBlockSender.h>
 #include <Storages/DistributedShuffleJoinSelector.h>
 #include <Storages/DistributedShuffleJoinTables.h>
+#include <Storages/IStorage.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageDistributed.h>
 #include <Core/QueryProcessingStage.h>
@@ -39,8 +46,11 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 
+#include <chrono>
+#include <limits>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace DB
 {
@@ -53,6 +63,8 @@ namespace ErrorCodes
 
 namespace Setting
 {
+    extern const SettingsUInt64 distributed_shuffle_join_table_ttl_ms;
+    extern const SettingsUInt64 interactive_delay;
     extern const SettingsUInt64 max_parser_backtracks;
     extern const SettingsUInt64 max_parser_depth;
 }
@@ -140,8 +152,8 @@ String formatLocalJoinProjectionList(const DistributedShuffleJoinInfo & info)
     String result;
     for (const auto & column : info.projection_columns)
     {
-        if (column.source_column_name.empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` projection source column cannot be empty");
+        if (column.expression.empty() && column.source_column_name.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` projection expression cannot be empty");
 
         if (column.result_column_name.empty())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` projection result column cannot be empty");
@@ -149,8 +161,16 @@ String formatLocalJoinProjectionList(const DistributedShuffleJoinInfo & info)
         if (!result.empty())
             result += ", ";
 
-        result += column.is_left ? "_shuffle_left." : "_shuffle_right.";
-        result += backQuoteIfNeed(column.source_column_name);
+        if (!column.expression.empty())
+        {
+            result += column.expression;
+        }
+        else
+        {
+            result += column.is_left ? "_shuffle_left." : "_shuffle_right.";
+            result += backQuoteIfNeed(column.source_column_name);
+        }
+
         result += " AS ";
         result += backQuoteIfNeed(column.result_column_name);
     }
@@ -317,6 +337,83 @@ String getShuffleJoinInitialQueryId(ContextPtr context)
         query_id = fmt::format("distributed_shuffle_join_{}", UUIDHelpers::generateV4());
 
     return query_id;
+}
+
+UInt64 getCurrentTimeMilliseconds()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+UInt64 getShuffleJoinExpirationTimeMilliseconds(ContextPtr context)
+{
+    const UInt64 ttl_ms = context->getSettingsRef()[Setting::distributed_shuffle_join_table_ttl_ms];
+    if (ttl_ms == 0)
+        return 0;
+
+    const UInt64 current_time_ms = getCurrentTimeMilliseconds();
+    if (ttl_ms > std::numeric_limits<UInt64>::max() - current_time_ms)
+        return std::numeric_limits<UInt64>::max();
+
+    return current_time_ms + ttl_ms;
+}
+
+void cleanupExpiredDistributedShuffleJoinTables(
+    const DistributedShuffleJoinTableNames & current_table_names,
+    ContextPtr context)
+{
+    auto database = DatabaseCatalog::instance().tryGetDatabase(current_table_names.database);
+    if (!database)
+        return;
+
+    const auto now_ms = getCurrentTimeMilliseconds();
+    std::vector<String> expired_table_names;
+    {
+        auto tables = database->getTablesIterator(
+            context,
+            [](const String & table_name)
+            {
+                return table_name.starts_with("_shuffle_");
+            });
+
+        for (; tables->isValid(); tables->next())
+        {
+            const auto & table_name = tables->name();
+            const auto & storage = tables->table();
+            if (!storage || storage->getName() != "Memory")
+                continue;
+
+            if (table_name == current_table_names.left_table || table_name == current_table_names.right_table)
+                continue;
+
+            const auto expiration_time_ms = tryGetDistributedShuffleJoinTableExpirationTimeMs(table_name);
+            if (!expiration_time_ms || *expiration_time_ms > now_ms)
+                continue;
+
+            expired_table_names.push_back(table_name);
+        }
+    }
+
+    for (const auto & table_name : expired_table_names)
+    {
+        try
+        {
+            InterpreterDropQuery::executeDropQuery(
+                ASTDropQuery::Kind::Drop,
+                context->getGlobalContext(),
+                context,
+                StorageID(current_table_names.database, table_name),
+                /* sync= */ true,
+                /* ignore_sync_setting= */ false,
+                /* need_ddl_guard= */ false);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(
+                __PRETTY_FUNCTION__,
+                fmt::format("Failed to drop expired distributed `shuffle join` table {}.{}", current_table_names.database, table_name));
+        }
+    }
 }
 
 ContextMutablePtr createDistributedShuffleJoinLocalJoinContext(ContextPtr context)
@@ -569,13 +666,18 @@ String createDistributedShuffleJoinLocalJoinQuery(
     validateExchangeInfo(info, DistributedShuffleJoinTableSide::Left);
     validateExchangeInfo(info, DistributedShuffleJoinTableSide::Right);
 
-    return fmt::format(
+    auto query = fmt::format(
         "SELECT {} FROM {} AS _shuffle_left INNER ALL JOIN {} AS _shuffle_right ON _shuffle_left.{} = _shuffle_right.{}",
         formatLocalJoinProjectionList(info),
         table_names.getQualifiedTableName(DistributedShuffleJoinTableSide::Left),
         table_names.getQualifiedTableName(DistributedShuffleJoinTableSide::Right),
         backQuoteIfNeed(info.left_key_column_name),
         backQuoteIfNeed(info.right_key_column_name));
+
+    if (!info.post_join_filter_condition.empty())
+        query += " WHERE " + info.post_join_filter_condition;
+
+    return query;
 }
 
 String createDistributedShuffleJoinRemoteExchangeQuery(String payload)
@@ -712,6 +814,9 @@ DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
     plan.left_header = createDistributedShuffleJoinExchangeHeader(info, DistributedShuffleJoinTableSide::Left);
     plan.right_header = createDistributedShuffleJoinExchangeHeader(info, DistributedShuffleJoinTableSide::Right);
     plan.local_join_query = createDistributedShuffleJoinLocalJoinQuery(plan.table_names, info);
+    plan.order_by = info.order_by;
+    plan.limit_length = info.limit_length;
+    plan.limit_offset = info.limit_offset;
     return plan;
 }
 
@@ -723,7 +828,10 @@ DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
 {
     return createDistributedShuffleJoinExecutionPlan(
         std::move(shuffle_database),
-        DistributedShuffleJoinExchangeId{.initial_query_id = getShuffleJoinInitialQueryId(context), .join_id = join_id},
+        DistributedShuffleJoinExchangeId{
+            .initial_query_id = getShuffleJoinInitialQueryId(context),
+            .join_id = join_id,
+            .expiration_time_ms = getShuffleJoinExpirationTimeMilliseconds(context)},
         info);
 }
 
@@ -787,6 +895,10 @@ void executeDistributedShuffleJoinExchangeQuery(
 
     auto query_context = Context::createCopy(context);
     query_context->setInternalQuery(true);
+
+    if (!context->getCurrentQueryId().empty())
+        query_context->setCurrentQueryId(fmt::format("{}:source:{}", context->getCurrentQueryId(), toString(side)));
+
     auto block_io = executeQuery(std::move(query), query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete).second;
     block_io.pipeline.complete(createDistributedShuffleJoinExchangeSink(
         std::move(cluster),
@@ -795,7 +907,36 @@ void executeDistributedShuffleJoinExchangeQuery(
         side,
         std::move(sender)));
 
+    if (auto parent_cancel_callback = context->getInteractiveCancelCallback())
+    {
+        query_context->setInteractiveCancelCallback(
+            [upstream_cancel_callback = std::move(parent_cancel_callback), query_context]() mutable
+            {
+                try
+                {
+                    if (!upstream_cancel_callback())
+                        return false;
+                }
+                catch (...)
+                {
+                    query_context->killCurrentQuery();
+                    throw;
+                }
+
+                query_context->killCurrentQuery();
+                return true;
+            });
+    }
+
     CompletedPipelineExecutor executor(block_io.pipeline);
+
+    if (auto callback = query_context->getInteractiveCancelCallback())
+    {
+        executor.setCancelCallback(
+            std::move(callback),
+            query_context->getSettingsRef()[Setting::interactive_delay] / 1000);
+    }
+
     executor.execute();
 }
 
@@ -862,6 +1003,8 @@ void executeDistributedShuffleJoinExchangePayload(
             exchange_payload.shard_count,
             cluster->getShardCount());
     }
+
+    cleanupExpiredDistributedShuffleJoinTables(exchange_payload.table_names, context);
 
     auto info = createDistributedShuffleJoinInfoFromExchangePayload(exchange_payload);
     auto sender = std::make_shared<ClusterDistributedShuffleJoinBlockSender>(cluster, context);
@@ -1032,6 +1175,7 @@ void buildDistributedShuffleJoinClusterLocalJoinQueryPlan(
     query_info.query = query_ast;
     query_info.cluster = std::move(cluster);
     query_info.is_internal = true;
+    query_info.storage_limits = std::make_shared<const StorageLimitsList>();
 
     ClusterProxy::SelectStreamFactory stream_factory(
         header,
@@ -1059,6 +1203,25 @@ void buildDistributedShuffleJoinClusterLocalJoinQueryPlan(
 
     if (!query_plan.isInitialized())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` local join did not create a query plan");
+
+    if (!plan.order_by.empty())
+    {
+        auto sorting_step = std::make_unique<SortingStep>(
+            query_plan.getCurrentHeader(),
+            plan.order_by,
+            /* limit= */ 0,
+            SortingStep::Settings(query_context->getSettingsRef()));
+        sorting_step->setStepDescription("Global sorting for distributed shuffle join");
+        query_plan.addStep(std::move(sorting_step));
+    }
+
+    if (plan.limit_length)
+    {
+        query_plan.addStep(std::make_unique<LimitStep>(
+            query_plan.getCurrentHeader(),
+            *plan.limit_length,
+            plan.limit_offset));
+    }
 }
 
 BlockIO executeDistributedShuffleJoinClusterLocalJoinPipeline(

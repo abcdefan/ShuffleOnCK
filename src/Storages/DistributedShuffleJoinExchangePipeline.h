@@ -46,6 +46,9 @@ struct DistributedShuffleJoinExecutionPlan
     Block left_header;
     Block right_header;
     String local_join_query;
+    SortDescription order_by;
+    std::optional<UInt64> limit_length;
+    UInt64 limit_offset = 0;
 };
 
 class IDistributedShuffleJoinExchangeSideExecutor

@@ -7,10 +7,13 @@
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/ListNode.h>
 #include <Analyzer/QueryNode.h>
+#include <Analyzer/SortNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/UnionNode.h>
 #include <Analyzer/Utils.h>
+#include <Common/quoteString.h>
 #include <Common/typeid_cast.h>
+#include <Core/Field.h>
 #include <Core/Settings.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
@@ -62,15 +65,12 @@ bool hasUnsupportedSelectClauses(const QueryNode & query_node)
         || query_node.hasHaving()
         || query_node.hasWindow()
         || query_node.hasQualify()
-        || query_node.hasOrderBy()
         || query_node.isOrderByAll()
         || query_node.hasInterpolate()
         || query_node.hasLimitByLimit()
         || query_node.hasLimitByOffset()
         || query_node.hasLimitBy()
         || query_node.isLimitByAll()
-        || query_node.hasLimit()
-        || query_node.hasOffset()
         || query_node.isLimitWithTies();
 }
 
@@ -207,6 +207,12 @@ void collectRequiredColumns(DistributedShuffleJoinInfo & info, QueryTreeNodePtr 
         info.right_required_columns = right_columns_it->second.columns;
 }
 
+std::optional<String> formatPostJoinExpression(
+    const QueryTreeNodePtr & node,
+    const DistributedShuffleJoinInfo & info);
+
+bool isDeterministicFilterExpression(const QueryTreeNodePtr & node);
+
 bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode & query_node)
 {
     const auto & projection_nodes = query_node.getProjection().getNodes();
@@ -220,25 +226,29 @@ bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode
 
     for (size_t i = 0; i < projection_nodes.size(); ++i)
     {
-        const auto * column_node = projection_nodes[i]->as<ColumnNode>();
-        if (!column_node)
-            return false;
-
-        auto column_source = column_node->getColumnSourceOrNull();
-        if (!column_source)
-            return false;
-
-        const bool is_left = column_source->isEqual(*info.left_table_expression);
-        const bool is_right = column_source->isEqual(*info.right_table_expression);
-        if (!is_left && !is_right)
-            return false;
-
-        info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn
+        if (const auto * column_node = projection_nodes[i]->as<ColumnNode>())
         {
-            .is_left = is_left,
-            .source_column_name = column_node->getColumnName(),
-            .result_column_name = projection_columns[i].name,
-        });
+            auto column_source = column_node->getColumnSourceOrNull();
+            if (!column_source)
+                return false;
+
+            const bool is_left = column_source->isEqual(*info.left_table_expression);
+            const bool is_right = column_source->isEqual(*info.right_table_expression);
+            if (!is_left && !is_right)
+                return false;
+
+            info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{is_left, column_node->getColumnName(), {}, projection_columns[i].name});
+            continue;
+        }
+
+        if (!isDeterministicFilterExpression(projection_nodes[i]))
+            return false;
+
+        auto expression = formatPostJoinExpression(projection_nodes[i], info);
+        if (!expression)
+            return false;
+
+        info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{false, {}, std::move(*expression), projection_columns[i].name});
     }
 
     return true;
@@ -308,6 +318,124 @@ String combineFilterConditions(const std::vector<String> & conditions)
     return result;
 }
 
+struct FilterSourceMask
+{
+    bool has_left = false;
+    bool has_right = false;
+
+    bool isConstant() const
+    {
+        return !has_left && !has_right;
+    }
+
+    bool isLeftOnly() const
+    {
+        return has_left && !has_right;
+    }
+
+    bool isRightOnly() const
+    {
+        return has_right && !has_left;
+    }
+
+    bool isPostJoin() const
+    {
+        return has_left && has_right;
+    }
+};
+
+bool collectFilterSourceMask(
+    const QueryTreeNodePtr & node,
+    const DistributedShuffleJoinInfo & info,
+    FilterSourceMask & result)
+{
+    if (const auto * column_node = node->as<ColumnNode>())
+    {
+        auto source = column_node->getColumnSourceOrNull();
+        if (!source)
+            return false;
+
+        if (source->isEqual(*info.left_table_expression))
+        {
+            result.has_left = true;
+            return true;
+        }
+
+        if (source->isEqual(*info.right_table_expression))
+        {
+            result.has_right = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    if (node->as<ConstantNode>())
+        return true;
+
+    if (const auto * function_node = node->as<FunctionNode>())
+    {
+        for (const auto & argument : function_node->getArguments().getNodes())
+            if (!collectFilterSourceMask(argument, info, result))
+                return false;
+
+        return true;
+    }
+
+    return false;
+}
+
+std::optional<String> formatPostJoinExpression(
+    const QueryTreeNodePtr & node,
+    const DistributedShuffleJoinInfo & info)
+{
+    if (const auto * column_node = node->as<ColumnNode>())
+    {
+        auto source = column_node->getColumnSourceOrNull();
+        if (!source)
+            return {};
+
+        String result;
+        if (source->isEqual(*info.left_table_expression))
+            result = "_shuffle_left.";
+        else if (source->isEqual(*info.right_table_expression))
+            result = "_shuffle_right.";
+        else
+            return {};
+
+        result += backQuoteIfNeed(column_node->getColumnName());
+        return result;
+    }
+
+    if (node->as<ConstantNode>())
+        return formatFilterCondition(node);
+
+    if (const auto * function_node = node->as<FunctionNode>())
+    {
+        String result = function_node->getFunctionName();
+        result += "(";
+
+        bool first = true;
+        for (const auto & argument : function_node->getArguments().getNodes())
+        {
+            auto formatted_argument = formatPostJoinExpression(argument, info);
+            if (!formatted_argument)
+                return {};
+
+            if (!first)
+                result += ", ";
+
+            result += *formatted_argument;
+            first = false;
+        }
+
+        result += ")";
+        return result;
+    }
+
+    return {};
+}
+
 bool collectWhereFilters(DistributedShuffleJoinInfo & info, const QueryNode & query_node)
 {
     if (!query_node.hasWhere())
@@ -318,20 +446,31 @@ bool collectWhereFilters(DistributedShuffleJoinInfo & info, const QueryNode & qu
 
     std::vector<String> left_conditions;
     std::vector<String> right_conditions;
+    std::vector<String> post_join_conditions;
 
     for (const auto & conjunct : conjuncts)
     {
         if (!isDeterministicFilterExpression(conjunct))
             return false;
 
-        auto [source, is_valid_source] = getExpressionSource(conjunct);
-        if (!is_valid_source)
+        FilterSourceMask source_mask;
+        if (!collectFilterSourceMask(conjunct, info, source_mask))
             return false;
 
+        if (source_mask.isPostJoin())
+        {
+            auto filter_condition = formatPostJoinExpression(conjunct, info);
+            if (!filter_condition)
+                return false;
+
+            post_join_conditions.push_back(std::move(*filter_condition));
+            continue;
+        }
+
         auto filter_condition = formatFilterCondition(conjunct);
-        if (!source || source->isEqual(*info.left_table_expression))
+        if (source_mask.isConstant() || source_mask.isLeftOnly())
             left_conditions.push_back(std::move(filter_condition));
-        else if (source->isEqual(*info.right_table_expression))
+        else if (source_mask.isRightOnly())
             right_conditions.push_back(std::move(filter_condition));
         else
             return false;
@@ -339,6 +478,69 @@ bool collectWhereFilters(DistributedShuffleJoinInfo & info, const QueryNode & qu
 
     info.left_filter_condition = combineFilterConditions(left_conditions);
     info.right_filter_condition = combineFilterConditions(right_conditions);
+    info.post_join_filter_condition = combineFilterConditions(post_join_conditions);
+    return true;
+}
+
+bool collectLimit(DistributedShuffleJoinInfo & info, const QueryNode & query_node)
+{
+    if (!query_node.hasLimit())
+        return !query_node.hasOffset();
+
+    const auto * limit_node = query_node.getLimit()->as<ConstantNode>();
+    if (!limit_node || limit_node->getValue().getType() != Field::Types::UInt64)
+        return false;
+
+    info.limit_length = limit_node->getValue().safeGet<UInt64>();
+    if (!query_node.hasOffset())
+        return true;
+
+    const auto * offset_node = query_node.getOffset()->as<ConstantNode>();
+    if (!offset_node || offset_node->getValue().getType() != Field::Types::UInt64)
+        return false;
+
+    info.limit_offset = offset_node->getValue().safeGet<UInt64>();
+    return true;
+}
+
+bool collectOrderBy(DistributedShuffleJoinInfo & info, const QueryNode & query_node)
+{
+    if (!query_node.hasOrderBy())
+        return true;
+
+    const auto & projection_nodes = query_node.getProjection().getNodes();
+    const auto & projection_columns = query_node.getProjectionColumns();
+    if (projection_nodes.size() != projection_columns.size())
+        return false;
+
+    for (const auto & order_by_node : query_node.getOrderBy().getNodes())
+    {
+        const auto * sort_node = order_by_node->as<SortNode>();
+        if (!sort_node || sort_node->withFill() || sort_node->getCollator())
+            return false;
+
+        size_t projection_index = projection_nodes.size();
+        for (size_t i = 0; i < projection_nodes.size(); ++i)
+        {
+            if (projection_nodes[i]->isEqual(*sort_node->getExpression(), {.compare_aliases = false}))
+            {
+                projection_index = i;
+                break;
+            }
+        }
+
+        if (projection_index == projection_nodes.size())
+            return false;
+
+        const int direction = sort_node->getSortDirection() == SortDirection::ASCENDING ? 1 : -1;
+        const auto nulls_sort_direction = sort_node->getNullsSortDirection();
+        const int nulls_direction = nulls_sort_direction
+            ? (*nulls_sort_direction == SortDirection::ASCENDING ? 1 : -1)
+            : direction;
+
+        info.order_by.emplace_back(projection_columns[projection_index].name, direction, nulls_direction);
+    }
+
     return true;
 }
 
@@ -456,6 +658,12 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
         return {};
 
     if (!collectProjectionColumns(info, *query_node))
+        return {};
+
+    if (!collectOrderBy(info, *query_node))
+        return {};
+
+    if (!collectLimit(info, *query_node))
         return {};
 
     return info;

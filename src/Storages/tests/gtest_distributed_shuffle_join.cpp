@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <optional>
 
 namespace DB
@@ -228,6 +229,8 @@ public:
 
     void executeOnShard(size_t shard_index, const String & query) override
     {
+        std::lock_guard lock(mutex);
+
         if (fail_at_query_index && queries.size() == *fail_at_query_index)
         {
             fail_at_query_index.reset();
@@ -239,6 +242,7 @@ public:
 
     void failAtQueryIndex(size_t query_index)
     {
+        std::lock_guard lock(mutex);
         fail_at_query_index = query_index;
     }
 
@@ -248,6 +252,7 @@ public:
     }
 
 private:
+    std::mutex mutex;
     std::vector<ExecutedQuery> queries;
     std::optional<size_t> fail_at_query_index;
 };
@@ -263,6 +268,8 @@ public:
 
     void executeOnShard(size_t shard_index, const DistributedShuffleJoinTableNames & table_names) override
     {
+        std::lock_guard lock(mutex);
+
         if (fail_at_exchange_index && exchanges.size() == *fail_at_exchange_index)
         {
             fail_at_exchange_index.reset();
@@ -274,6 +281,7 @@ public:
 
     void failAtExchangeIndex(size_t exchange_index)
     {
+        std::lock_guard lock(mutex);
         fail_at_exchange_index = exchange_index;
     }
 
@@ -283,6 +291,7 @@ public:
     }
 
 private:
+    std::mutex mutex;
     std::vector<ExecutedExchange> exchanges;
     std::optional<size_t> fail_at_exchange_index;
 };
@@ -298,6 +307,8 @@ public:
 
     void executeOnShard(size_t shard_index, const String & query) override
     {
+        std::lock_guard lock(mutex);
+
         if (fail_at_join_index && joins.size() == *fail_at_join_index)
         {
             fail_at_join_index.reset();
@@ -309,6 +320,7 @@ public:
 
     void failAtJoinIndex(size_t join_index)
     {
+        std::lock_guard lock(mutex);
         fail_at_join_index = join_index;
     }
 
@@ -318,6 +330,7 @@ public:
     }
 
 private:
+    std::mutex mutex;
     std::vector<ExecutedLocalJoin> joins;
     std::optional<size_t> fail_at_join_index;
 };
@@ -592,9 +605,9 @@ TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithProjection)
         {"right value", std::make_shared<DataTypeUInt64>()},
     };
     info.projection_columns = {
-        DistributedShuffleJoinProjectionColumn{.is_left = true, .source_column_name = "id", .result_column_name = "id"},
-        DistributedShuffleJoinProjectionColumn{.is_left = true, .source_column_name = "left value", .result_column_name = "value"},
-        DistributedShuffleJoinProjectionColumn{.is_left = false, .source_column_name = "right value", .result_column_name = "right value"},
+        DistributedShuffleJoinProjectionColumn{true, "id", "", "id"},
+        DistributedShuffleJoinProjectionColumn{true, "left value", "", "value"},
+        DistributedShuffleJoinProjectionColumn{false, "right value", "", "right value"},
     };
 
     const auto table_names = createDistributedShuffleJoinTableNames(
@@ -607,6 +620,43 @@ TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithProjection)
         "FROM default._shuffle_local_join_projection_test_20_left AS _shuffle_left "
         "INNER ALL JOIN default._shuffle_local_join_projection_test_20_right AS _shuffle_right "
         "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithExpressionProjection)
+{
+    auto info = makeExchangeInfo();
+    info.projection_columns = {
+        DistributedShuffleJoinProjectionColumn{false, "", "_shuffle_left.id", "id"},
+        DistributedShuffleJoinProjectionColumn{false, "", "plus(_shuffle_left.id, _shuffle_right.id)", "sum id"},
+    };
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-join-expression-projection-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(table_names, info),
+        "SELECT _shuffle_left.id AS id, plus(_shuffle_left.id, _shuffle_right.id) AS `sum id` "
+        "FROM default._shuffle_local_join_expression_projection_test_0_left AS _shuffle_left "
+        "INNER ALL JOIN default._shuffle_local_join_expression_projection_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithPostJoinFilter)
+{
+    auto info = makeExchangeInfo();
+    info.post_join_filter_condition = "greaterOrEquals(plus(_shuffle_left.id, _shuffle_right.id), 6)";
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-join-filter-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(table_names, info),
+        "SELECT * FROM default._shuffle_local_join_filter_test_0_left AS _shuffle_left "
+        "INNER ALL JOIN default._shuffle_local_join_filter_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id "
+        "WHERE greaterOrEquals(plus(_shuffle_left.id, _shuffle_right.id), 6)");
 }
 
 TEST(DistributedShuffleJoin, CreatesExecutionPlan)
@@ -649,8 +699,45 @@ TEST(DistributedShuffleJoin, ExecutionPlanUsesUniqueFallbackQueryId)
     const auto plan = createDistributedShuffleJoinExecutionPlan(context, 7, makeExchangeInfo());
 
     EXPECT_TRUE(plan.table_names.left_table.starts_with("_shuffle_distributed_shuffle_join_"));
-    EXPECT_TRUE(plan.table_names.left_table.ends_with("_7_left"));
+    EXPECT_TRUE(plan.table_names.left_table.ends_with("_left"));
     EXPECT_NE(plan.table_names.left_table, "_shuffle_distributed_shuffle_join_7_left");
+    EXPECT_TRUE(tryGetDistributedShuffleJoinTableExpirationTimeMs(plan.table_names.left_table).has_value());
+}
+
+TEST(DistributedShuffleJoin, ExecutionPlanCarriesGlobalLimit)
+{
+    auto info = makeExchangeInfo();
+    info.limit_length = 2;
+    info.limit_offset = 1;
+
+    const auto plan = createDistributedShuffleJoinExecutionPlan(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "limit-plan-test", .join_id = 0},
+        info);
+
+    ASSERT_TRUE(plan.limit_length.has_value());
+    EXPECT_EQ(*plan.limit_length, 2);
+    EXPECT_EQ(plan.limit_offset, 1);
+}
+
+TEST(DistributedShuffleJoin, ExecutionPlanCarriesGlobalOrderBy)
+{
+    auto info = makeExchangeInfo();
+    info.order_by.emplace_back("id", -1, -1);
+    info.order_by.emplace_back("value", 1, 1);
+
+    const auto plan = createDistributedShuffleJoinExecutionPlan(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "order-plan-test", .join_id = 0},
+        info);
+
+    ASSERT_EQ(plan.order_by.size(), 2);
+    EXPECT_EQ(plan.order_by[0].column_name, "id");
+    EXPECT_EQ(plan.order_by[0].direction, -1);
+    EXPECT_EQ(plan.order_by[0].nulls_direction, -1);
+    EXPECT_EQ(plan.order_by[1].column_name, "value");
+    EXPECT_EQ(plan.order_by[1].direction, 1);
+    EXPECT_EQ(plan.order_by[1].nulls_direction, 1);
 }
 
 TEST(DistributedShuffleJoin, CreatesRemoteExchangeQuery)
@@ -886,6 +973,22 @@ TEST(DistributedShuffleJoin, CreatesMemoryTableNamesAndQueries)
         "DROP TABLE IF EXISTS default._shuffle_query_with_dashes_7_right");
 }
 
+TEST(DistributedShuffleJoin, EncodesAndParsesMemoryTableExpiration)
+{
+    const DistributedShuffleJoinExchangeId exchange_id{
+        .initial_query_id = "expiring-query",
+        .join_id = 2,
+        .expiration_time_ms = 123456};
+    const auto table_names = createDistributedShuffleJoinTableNames("default", exchange_id);
+
+    EXPECT_EQ(table_names.left_table, "_shuffle_expiring_query_2_expires_123456_left");
+    EXPECT_EQ(table_names.right_table, "_shuffle_expiring_query_2_expires_123456_right");
+    EXPECT_EQ(tryGetDistributedShuffleJoinTableExpirationTimeMs(table_names.left_table), 123456);
+    EXPECT_EQ(tryGetDistributedShuffleJoinTableExpirationTimeMs(table_names.right_table), 123456);
+    EXPECT_FALSE(tryGetDistributedShuffleJoinTableExpirationTimeMs("_shuffle_expiring_query_2_left").has_value());
+    EXPECT_FALSE(tryGetDistributedShuffleJoinTableExpirationTimeMs("_shuffle_expiring_query_2_expires_invalid_left").has_value());
+}
+
 TEST(DistributedShuffleJoin, CreatesMemoryTableHeaderFromRequiredColumns)
 {
     const NamesAndTypes required_columns
@@ -921,14 +1024,12 @@ TEST(DistributedShuffleJoin, CoordinatorPreparesAndCleansMemoryTables)
     const auto drop_right = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right);
 
     ASSERT_EQ(executor.getQueries().size(), 4);
-    EXPECT_EQ(executor.getQueries()[0].shard_index, 0);
     EXPECT_EQ(executor.getQueries()[0].query, create_left);
-    EXPECT_EQ(executor.getQueries()[1].shard_index, 1);
     EXPECT_EQ(executor.getQueries()[1].query, create_left);
-    EXPECT_EQ(executor.getQueries()[2].shard_index, 0);
     EXPECT_EQ(executor.getQueries()[2].query, create_right);
-    EXPECT_EQ(executor.getQueries()[3].shard_index, 1);
     EXPECT_EQ(executor.getQueries()[3].query, create_right);
+    EXPECT_NE(executor.getQueries()[0].shard_index, executor.getQueries()[1].shard_index);
+    EXPECT_NE(executor.getQueries()[2].shard_index, executor.getQueries()[3].shard_index);
 
     coordinator.cleanupShuffleTables();
     EXPECT_TRUE(coordinator.hasCleanedUpShuffleTables());
@@ -980,8 +1081,7 @@ TEST(DistributedShuffleJoin, ExecutionStagesRunPrepareExchangeJoinAndCleanup)
     EXPECT_EQ(query_executor.getQueries()[7].query, drop_right);
 
     ASSERT_EQ(exchange_executor.getExchanges().size(), 2);
-    EXPECT_EQ(exchange_executor.getExchanges()[0].shard_index, 0);
-    EXPECT_EQ(exchange_executor.getExchanges()[1].shard_index, 1);
+    EXPECT_NE(exchange_executor.getExchanges()[0].shard_index, exchange_executor.getExchanges()[1].shard_index);
 
     ASSERT_EQ(local_join_executor.getJoins().size(), 2);
     EXPECT_EQ(local_join_executor.getJoins()[0].query, plan.local_join_query);
@@ -1213,14 +1313,48 @@ TEST(DistributedShuffleJoin, CoordinatorCleansMemoryTablesAfterPrepareFailure)
 
     const auto drop_left = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Left);
     const auto drop_right = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right);
+    const auto create_left = createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader());
+    const auto create_right = createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Right, *makeHeader());
+    const auto count_query = [&](const String & query)
+    {
+        return std::count_if(executor.getQueries().begin(), executor.getQueries().end(), [&](const auto & executed)
+        {
+            return executed.query == query;
+        });
+    };
 
-    ASSERT_EQ(executor.getQueries().size(), 6);
-    EXPECT_EQ(executor.getQueries()[0].query, createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader()));
-    EXPECT_EQ(executor.getQueries()[1].query, createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader()));
-    EXPECT_EQ(executor.getQueries()[2].query, drop_left);
-    EXPECT_EQ(executor.getQueries()[3].query, drop_left);
-    EXPECT_EQ(executor.getQueries()[4].query, drop_right);
-    EXPECT_EQ(executor.getQueries()[5].query, drop_right);
+    EXPECT_EQ(count_query(create_left), 2);
+    EXPECT_LE(count_query(create_right), 1);
+    EXPECT_EQ(count_query(drop_left), 2);
+    EXPECT_EQ(count_query(drop_right), 2);
+}
+
+TEST(DistributedShuffleJoin, CoordinatorContinuesCleanupAfterDropFailure)
+{
+    const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "coordinator-drop-failure-test", .join_id = 20};
+    const auto table_names = createDistributedShuffleJoinTableNames("default", exchange_id);
+
+    RecordingShuffleQueryExecutor executor;
+    DistributedShuffleJoinCoordinator coordinator(table_names, *makeHeader(), *makeHeader(), 2, executor);
+    coordinator.prepareShuffleTables();
+
+    executor.failAtQueryIndex(4);
+    coordinator.cleanupShuffleTables();
+
+    EXPECT_TRUE(coordinator.hasCleanedUpShuffleTables());
+
+    const auto drop_left = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Left);
+    const auto drop_right = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right);
+    const auto count_query = [&](const String & query)
+    {
+        return std::count_if(executor.getQueries().begin(), executor.getQueries().end(), [&](const auto & executed)
+        {
+            return executed.query == query;
+        });
+    };
+
+    EXPECT_EQ(count_query(drop_left), 1);
+    EXPECT_EQ(count_query(drop_right), 2);
 }
 
 TEST(DistributedShuffleJoin, CoordinatorRunsExchangeAfterPrepare)
@@ -1239,10 +1373,9 @@ TEST(DistributedShuffleJoin, CoordinatorRunsExchangeAfterPrepare)
 
     EXPECT_TRUE(coordinator.hasExchangedShuffleTables());
     ASSERT_EQ(exchange_executor.getExchanges().size(), 2);
-    EXPECT_EQ(exchange_executor.getExchanges()[0].shard_index, 0);
     EXPECT_EQ(exchange_executor.getExchanges()[0].table_names.left_table, table_names.left_table);
-    EXPECT_EQ(exchange_executor.getExchanges()[1].shard_index, 1);
     EXPECT_EQ(exchange_executor.getExchanges()[1].table_names.right_table, table_names.right_table);
+    EXPECT_NE(exchange_executor.getExchanges()[0].shard_index, exchange_executor.getExchanges()[1].shard_index);
 
     coordinator.exchangeShuffleTables(exchange_executor);
     EXPECT_EQ(exchange_executor.getExchanges().size(), 2);
@@ -1269,7 +1402,6 @@ TEST(DistributedShuffleJoin, CoordinatorCleansMemoryTablesAfterExchangeFailure)
     const auto drop_right = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right);
 
     ASSERT_EQ(exchange_executor.getExchanges().size(), 1);
-    EXPECT_EQ(exchange_executor.getExchanges()[0].shard_index, 0);
     ASSERT_EQ(query_executor.getQueries().size(), 8);
     EXPECT_EQ(query_executor.getQueries()[4].query, drop_left);
     EXPECT_EQ(query_executor.getQueries()[5].query, drop_left);
@@ -1298,10 +1430,9 @@ TEST(DistributedShuffleJoin, CoordinatorRunsLocalJoinAfterExchange)
 
     EXPECT_TRUE(coordinator.hasJoinedShuffleTables());
     ASSERT_EQ(local_join_executor.getJoins().size(), 2);
-    EXPECT_EQ(local_join_executor.getJoins()[0].shard_index, 0);
     EXPECT_EQ(local_join_executor.getJoins()[0].query, local_join_query);
-    EXPECT_EQ(local_join_executor.getJoins()[1].shard_index, 1);
     EXPECT_EQ(local_join_executor.getJoins()[1].query, local_join_query);
+    EXPECT_NE(local_join_executor.getJoins()[0].shard_index, local_join_executor.getJoins()[1].shard_index);
 
     coordinator.joinShuffleTables(local_join_query, local_join_executor);
     EXPECT_EQ(local_join_executor.getJoins().size(), 2);
@@ -1332,7 +1463,6 @@ TEST(DistributedShuffleJoin, CoordinatorCleansMemoryTablesAfterLocalJoinFailure)
     const auto drop_right = dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right);
 
     ASSERT_EQ(local_join_executor.getJoins().size(), 1);
-    EXPECT_EQ(local_join_executor.getJoins()[0].shard_index, 0);
     ASSERT_EQ(query_executor.getQueries().size(), 8);
     EXPECT_EQ(query_executor.getQueries()[4].query, drop_left);
     EXPECT_EQ(query_executor.getQueries()[5].query, drop_left);

@@ -119,6 +119,9 @@ ContextMutablePtr buildContext(const ContextPtr & context, const SelectQueryOpti
 {
     auto result_context = Context::createCopy(context);
 
+    if (result_context->getSettingsRef()[Setting::distributed_shuffle_join])
+        result_context->setInteractiveCancelCallback(context->getInteractiveCancelCallback());
+
     if (select_query_options.shard_num)
         result_context->addSpecialScalar(
             "_shard_num",

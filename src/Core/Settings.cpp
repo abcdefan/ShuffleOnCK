@@ -1979,6 +1979,11 @@ Timeout in milliseconds for the experimental distributed `shuffle join` exchange
 
 The setting is intended only for development and testing while the distributed `shuffle join` coordinator is being implemented.
 )", EXPERIMENTAL) \
+    DECLARE(UInt64, distributed_shuffle_join_table_ttl_ms, 3600000, R"(
+Maximum lifetime in milliseconds for ordinary `Memory` tables created by the experimental distributed `shuffle join` path.
+
+Each shuffle table encodes its absolute expiration time in its name. When another shuffle exchange reaches the same shard and database, it removes expired leftover tables before writing new buckets. Set this value above the longest expected shuffle query duration.
+)", EXPERIMENTAL) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.

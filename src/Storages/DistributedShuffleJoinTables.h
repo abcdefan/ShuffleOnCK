@@ -5,6 +5,7 @@
 #include <base/types.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace DB
 {
@@ -13,6 +14,7 @@ struct DistributedShuffleJoinExchangeId
 {
     String initial_query_id;
     size_t join_id = 0;
+    UInt64 expiration_time_ms = 0;
 
     String toString() const;
 
@@ -46,6 +48,7 @@ struct DistributedShuffleJoinTableNames
 };
 
 String makeDistributedShuffleJoinTableNamePrefix(const DistributedShuffleJoinExchangeId & id);
+std::optional<UInt64> tryGetDistributedShuffleJoinTableExpirationTimeMs(const String & table_name);
 DistributedShuffleJoinTableNames createDistributedShuffleJoinTableNames(String database, const DistributedShuffleJoinExchangeId & id);
 Block createDistributedShuffleJoinTableHeader(const NamesAndTypes & columns);
 

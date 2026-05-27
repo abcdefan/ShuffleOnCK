@@ -5,7 +5,9 @@
 #include <DataTypes/IDataType.h>
 #include <fmt/format.h>
 
+#include <charconv>
 #include <cctype>
+#include <string_view>
 
 namespace DB
 {
@@ -107,7 +109,42 @@ String makeDistributedShuffleJoinTableNamePrefix(const DistributedShuffleJoinExc
     if (id.initial_query_id.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` table name cannot be created with empty initial query id");
 
-    return fmt::format("_shuffle_{}_{}", sanitizeIdentifierFragment(id.initial_query_id), id.join_id);
+    auto prefix = fmt::format("_shuffle_{}_{}", sanitizeIdentifierFragment(id.initial_query_id), id.join_id);
+    if (id.expiration_time_ms != 0)
+        prefix += fmt::format("_expires_{}", id.expiration_time_ms);
+
+    return prefix;
+}
+
+std::optional<UInt64> tryGetDistributedShuffleJoinTableExpirationTimeMs(const String & table_name)
+{
+    static constexpr std::string_view prefix = "_shuffle_";
+    static constexpr std::string_view expiration_marker = "_expires_";
+
+    if (!table_name.starts_with(prefix))
+        return {};
+
+    const auto expiration_pos = table_name.rfind(expiration_marker);
+    if (expiration_pos == String::npos)
+        return {};
+
+    const auto expiration_begin = expiration_pos + expiration_marker.size();
+    const auto expiration_end = table_name.find('_', expiration_begin);
+    if (expiration_end == String::npos)
+        return {};
+
+    const auto side = std::string_view(table_name).substr(expiration_end);
+    if (side != "_left" && side != "_right")
+        return {};
+
+    UInt64 expiration_time_ms = 0;
+    const auto * begin = table_name.data() + expiration_begin;
+    const auto * end = table_name.data() + expiration_end;
+    const auto parse_result = std::from_chars(begin, end, expiration_time_ms);
+    if (parse_result.ec != std::errc{} || parse_result.ptr != end)
+        return {};
+
+    return expiration_time_ms;
 }
 
 DistributedShuffleJoinTableNames createDistributedShuffleJoinTableNames(String database, const DistributedShuffleJoinExchangeId & id)

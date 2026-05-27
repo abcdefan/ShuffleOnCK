@@ -42,6 +42,7 @@
 #include <Parsers/Prometheus/ParserPrometheusQuery.h>
 
 #include <Formats/FormatFactory.h>
+#include <Storages/DistributedShuffleJoinAnalyzer.h>
 #include <Storages/StorageInput.h>
 
 #include <Access/ContextAccess.h>
@@ -143,6 +144,7 @@ namespace Setting
     extern const SettingsBool log_formatted_queries;
     extern const SettingsBool log_profile_events;
     extern const SettingsUInt64 log_queries_cut_to_length;
+    extern const SettingsBool distributed_shuffle_join;
     extern const SettingsBool log_queries;
     extern const SettingsMilliseconds log_queries_min_query_duration_ms;
     extern const SettingsLogQueriesType log_queries_min_type;
@@ -1752,8 +1754,21 @@ static BlockIO executeQueryImpl(
 
                 // InterpreterSelectQueryAnalyzer does not build QueryPlan in the constructor.
                 // We need to force to build it here to check if we need to ignore quota.
+                // Distributed `shuffle join` deliberately bypasses the ordinary planner because it
+                // would reject the MVP query shape as a double-distributed `JOIN` before `execute` can
+                // build the shuffle pipeline.
                 if (auto * interpreter_with_analyzer = dynamic_cast<InterpreterSelectQueryAnalyzer *>(interpreter.get()))
-                    interpreter_with_analyzer->getQueryPlan();
+                {
+                    const bool can_use_distributed_shuffle_join
+                        = query_settings[Setting::distributed_shuffle_join]
+                        && stage == QueryProcessingStage::Complete
+                        && tryAnalyzeDistributedShuffleJoin(
+                            interpreter_with_analyzer->getQueryTree(),
+                            interpreter_with_analyzer->getContext()).has_value();
+
+                    if (!can_use_distributed_shuffle_join)
+                        interpreter_with_analyzer->getQueryPlan();
+                }
 
                 if (!(interpreter && interpreter->ignoreQuota()) && !quota_checked)
                 {

@@ -2,6 +2,7 @@
 
 #include <Analyzer/IQueryTreeNode.h>
 #include <Core/NamesAndTypes.h>
+#include <Core/SortDescription.h>
 #include <Interpreters/Context_fwd.h>
 #include <base/types.h>
 
@@ -18,6 +19,7 @@ struct DistributedShuffleJoinProjectionColumn
 {
     bool is_left = false;
     String source_column_name;
+    String expression;
     String result_column_name;
 };
 
@@ -39,6 +41,10 @@ struct DistributedShuffleJoinInfo
     std::vector<DistributedShuffleJoinProjectionColumn> projection_columns;
     String left_filter_condition;
     String right_filter_condition;
+    String post_join_filter_condition;
+    SortDescription order_by;
+    std::optional<UInt64> limit_length;
+    UInt64 limit_offset = 0;
 
     String cluster_name;
     String shuffle_database;
