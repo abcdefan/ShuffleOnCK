@@ -293,6 +293,18 @@
     M(DistributedDelayedInserts, "Number of times the INSERT of a block to a Distributed table was throttled due to high number of pending bytes.", ValueType::Number) \
     M(DistributedRejectedInserts, "Number of times the INSERT of a block to a Distributed table was rejected with 'Too many bytes' exception due to high number of pending bytes.", ValueType::Number) \
     M(DistributedDelayedInsertsMilliseconds, "Total number of milliseconds spent while the INSERT of a block to a Distributed table was throttled due to high number of pending bytes.", ValueType::Milliseconds) \
+    M(DistributedShuffleJoinExchangeInputBlocks, "Number of non-empty blocks consumed by Distributed shuffle JOIN exchange sinks.", ValueType::Number) \
+    M(DistributedShuffleJoinExchangeInputRows, "Number of rows consumed by Distributed shuffle JOIN exchange sinks.", ValueType::Number) \
+    M(DistributedShuffleJoinExchangeInputBytes, "Number of bytes consumed by Distributed shuffle JOIN exchange sinks.", ValueType::Bytes) \
+    M(DistributedShuffleJoinExchangeOutputBlocks, "Number of non-empty per-shard blocks produced by Distributed shuffle JOIN exchange sinks.", ValueType::Number) \
+    M(DistributedShuffleJoinExchangeOutputRows, "Number of rows produced by Distributed shuffle JOIN exchange sinks after partitioning.", ValueType::Number) \
+    M(DistributedShuffleJoinExchangeOutputBytes, "Number of bytes produced by Distributed shuffle JOIN exchange sinks after partitioning.", ValueType::Bytes) \
+    M(DistributedShuffleJoinLocalOutputBlocks, "Number of Distributed shuffle JOIN blocks accepted by local target shard insert pipelines.", ValueType::Number) \
+    M(DistributedShuffleJoinLocalOutputRows, "Number of Distributed shuffle JOIN rows accepted by local target shard insert pipelines.", ValueType::Number) \
+    M(DistributedShuffleJoinLocalOutputBytes, "Number of Distributed shuffle JOIN bytes accepted by local target shard insert pipelines.", ValueType::Bytes) \
+    M(DistributedShuffleJoinRemoteOutputBlocks, "Number of Distributed shuffle JOIN blocks accepted by remote target shard insert pipelines.", ValueType::Number) \
+    M(DistributedShuffleJoinRemoteOutputRows, "Number of Distributed shuffle JOIN rows accepted by remote target shard insert pipelines.", ValueType::Number) \
+    M(DistributedShuffleJoinRemoteOutputBytes, "Number of Distributed shuffle JOIN bytes accepted by remote target shard insert pipelines.", ValueType::Bytes) \
     M(DuplicatedInsertedBlocks, "Number of the synchronous inserts to a *MergeTree table was deduplicated.", ValueType::Number) \
     M(SelfDuplicatedAsyncInserts, "Number of async inserts in the INSERTed block to a ReplicatedMergeTree table was self deduplicated.", ValueType::Number) \
     M(DuplicatedAsyncInserts, "Number of async inserts in the INSERTed block to a ReplicatedMergeTree table was deduplicated.", ValueType::Number) \

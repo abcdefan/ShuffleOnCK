@@ -1,8 +1,19 @@
 #include <Storages/DistributedShuffleJoinSink.h>
 
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <fmt/format.h>
+
+namespace ProfileEvents
+{
+    extern const Event DistributedShuffleJoinExchangeInputBlocks;
+    extern const Event DistributedShuffleJoinExchangeInputRows;
+    extern const Event DistributedShuffleJoinExchangeInputBytes;
+    extern const Event DistributedShuffleJoinExchangeOutputBlocks;
+    extern const Event DistributedShuffleJoinExchangeOutputRows;
+    extern const Event DistributedShuffleJoinExchangeOutputBytes;
+}
 
 namespace DB
 {
@@ -39,13 +50,26 @@ DistributedShuffleJoinSink::DistributedShuffleJoinSink(
 
 void DistributedShuffleJoinSink::consume(Chunk & chunk)
 {
+    const auto input_rows = chunk.getNumRows();
+    const auto input_bytes = chunk.bytes();
     auto block = getHeader().cloneWithColumns(chunk.getColumns());
     auto split_blocks = splitBlock(block);
+
+    if (input_rows)
+    {
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinExchangeInputBlocks);
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinExchangeInputRows, input_rows);
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinExchangeInputBytes, input_bytes);
+    }
 
     for (size_t target_shard_index = 0; target_shard_index < split_blocks.size(); ++target_shard_index)
     {
         if (!split_blocks[target_shard_index].rows())
             continue;
+
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinExchangeOutputBlocks);
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinExchangeOutputRows, split_blocks[target_shard_index].rows());
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinExchangeOutputBytes, split_blocks[target_shard_index].bytes());
 
         sender->sendBlock(
             table_names,

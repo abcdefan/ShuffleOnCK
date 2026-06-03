@@ -4,8 +4,6 @@ import shutil
 import statistics
 import time
 
-from concurrent.futures import ThreadPoolExecutor
-
 import pytest
 
 from helpers.cluster import ClickHouseCluster
@@ -18,26 +16,30 @@ node2 = cluster.add_instance("node2", main_configs=["configs/remote_servers.xml"
 node3 = cluster.add_instance("node3", main_configs=["configs/remote_servers.xml"])
 nodes = (node1, node2, node3)
 
-SHARD_COUNT = 3
+SHARD_COUNT = len(nodes)
 LEFT_ROWS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_LEFT_ROWS", "30000"))
-RIGHT_ROWS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_RIGHT_ROWS", "6000000"))
+RIGHT_ROWS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_RIGHT_ROWS", "1000000"))
 WARMUP_RUNS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_WARMUP_RUNS", "1"))
 MEASURED_RUNS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_MEASURED_RUNS", "3"))
+CORRECTNESS_ROWS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_CORRECTNESS_ROWS", "10000"))
+MAX_OUTPUT_ROWS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_MAX_OUTPUT_ROWS", "1000000"))
+MAX_THREADS = int(os.environ.get("CLICKHOUSE_SHUFFLE_PERF_MAX_THREADS", "2"))
+ALLOW_LARGE_OUTPUT = os.environ.get("CLICKHOUSE_SHUFFLE_PERF_ALLOW_LARGE_OUTPUT") == "1"
 REPOSITORY_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 RESULT_PATH = os.environ.get(
     "CLICKHOUSE_SHUFFLE_PERF_RESULT_PATH",
     os.path.join(REPOSITORY_ROOT, "build", "distributed_shuffle_join_performance_results.json"),
 )
 
-COMMON_SETTINGS = """
+COMMON_SETTINGS = f"""
     enable_analyzer = 1,
-    max_threads = 4,
+    max_threads = {MAX_THREADS},
     use_query_cache = 0,
     join_algorithm = 'hash'
 """
 
 
-def distributed_query(mode, output_columns, output_format):
+def distributed_query(mode, output_columns, output_format, where_clause=""):
     if mode == "global":
         join = "GLOBAL INNER ALL JOIN default.right_dist AS b USING (id)"
         settings = COMMON_SETTINGS
@@ -54,44 +56,28 @@ def distributed_query(mode, output_columns, output_format):
         SELECT {output_columns}
         FROM default.left_dist AS a
         {join}
+        {where_clause}
         SETTINGS {settings}
         FORMAT {output_format}
     """
 
 
-def sql_bucket_query(bucket, output_columns, output_format):
-    return f"""
-        SELECT {output_columns}
-        FROM
-        (
-            SELECT id, a_payload
-            FROM default.left_dist
-            WHERE modulo(cityHash64(id), {SHARD_COUNT}) = {bucket}
-        ) AS a
-        INNER ALL JOIN
-        (
-            SELECT id, b_payload_1, b_payload_2, b_payload_3
-            FROM default.right_dist
-            WHERE modulo(cityHash64(id), {SHARD_COUNT}) = {bucket}
-        ) AS b USING (id)
-        SETTINGS {COMMON_SETTINGS}, distributed_product_mode = 'allow', prefer_global_in_and_join = 0
-        FORMAT {output_format}
-    """
+def run_mode(mode, output_columns, output_format, where_clause=""):
+    return node1.query(distributed_query(mode, output_columns, output_format, where_clause), timeout=600)
 
 
-def run_sql_bucket_mode(output_columns, output_format):
-    with ThreadPoolExecutor(max_workers=SHARD_COUNT) as executor:
-        futures = [
-            executor.submit(node.query, sql_bucket_query(bucket, output_columns, output_format), timeout=600)
-            for bucket, node in enumerate(nodes)
-        ]
-        return "".join(future.result() for future in futures)
-
-
-def run_mode(mode, output_columns, output_format):
-    if mode == "sql_bucket":
-        return run_sql_bucket_mode(output_columns, output_format)
-    return node1.query(distributed_query(mode, output_columns, output_format), timeout=600)
+def validate_workload():
+    output_rows = min(LEFT_ROWS, RIGHT_ROWS)
+    if MAX_THREADS < 1 or MAX_THREADS > 4:
+        pytest.fail("CLICKHOUSE_SHUFFLE_PERF_MAX_THREADS must be between 1 and 4")
+    if CORRECTNESS_ROWS < 1:
+        pytest.fail("CLICKHOUSE_SHUFFLE_PERF_CORRECTNESS_ROWS must be positive")
+    if output_rows > MAX_OUTPUT_ROWS and not ALLOW_LARGE_OUTPUT:
+        pytest.fail(
+            f"Benchmark would produce {output_rows} matched rows, above the safe default limit of "
+            f"{MAX_OUTPUT_ROWS}. Set CLICKHOUSE_SHUFFLE_PERF_ALLOW_LARGE_OUTPUT=1 only after "
+            "checking available resources."
+        )
 
 
 def create_tables():
@@ -178,6 +164,7 @@ def insert_data():
 
 @pytest.fixture(scope="module")
 def started_cluster():
+    validate_workload()
     shutil.rmtree(cluster.instances_dir, ignore_errors=True)
     try:
         cluster.start()
@@ -192,13 +179,15 @@ def started_cluster():
     os.environ.get("CLICKHOUSE_RUN_SHUFFLE_PERFORMANCE_COMPARISON") != "1",
     reason="Manual benchmark; set CLICKHOUSE_RUN_SHUFFLE_PERFORMANCE_COMPARISON=1",
 )
-def test_large_right_table_join_modes(started_cluster):
-    modes = ("global", "allow", "sql_bucket", "exchange")
+def test_distributed_join_modes(started_cluster):
+    modes = ("global", "allow", "exchange")
 
-    expected_ids = run_mode("global", "a.id", "TSV").splitlines()
-    expected_ids.sort()
-    for mode in modes[1:]:
-        ids = run_mode(mode, "a.id", "TSV").splitlines()
+    output_rows = min(LEFT_ROWS, RIGHT_ROWS)
+    correctness_rows = min(output_rows, CORRECTNESS_ROWS)
+    correctness_filter = f"WHERE a.id <= {correctness_rows}"
+    expected_ids = list(range(1, correctness_rows + 1))
+    for mode in modes:
+        ids = [int(value) for value in run_mode(mode, "a.id", "TSV", correctness_filter).splitlines()]
         ids.sort()
         assert ids == expected_ids
 
@@ -223,10 +212,12 @@ def test_large_right_table_join_modes(started_cluster):
             {
                 "left_rows": LEFT_ROWS,
                 "right_rows": RIGHT_ROWS,
-                "shards": SHARD_COUNT,
+                "shards": len(nodes),
                 "warmup_runs": WARMUP_RUNS,
                 "measured_runs": MEASURED_RUNS,
-                "output_rows": len(expected_ids),
+                "output_rows": output_rows,
+                "correctness_rows": correctness_rows,
+                "max_threads": MAX_THREADS,
             },
             sort_keys=True,
         )
@@ -247,10 +238,12 @@ def test_large_right_table_join_modes(started_cluster):
         "context": {
             "left_rows": LEFT_ROWS,
             "right_rows": RIGHT_ROWS,
-            "shards": SHARD_COUNT,
+            "shards": len(nodes),
             "warmup_runs": WARMUP_RUNS,
             "measured_runs": MEASURED_RUNS,
-            "output_rows": len(expected_ids),
+            "output_rows": output_rows,
+            "correctness_rows": correctness_rows,
+            "max_threads": MAX_THREADS,
         },
         "summaries": summaries,
     }

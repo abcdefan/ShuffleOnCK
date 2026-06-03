@@ -60,6 +60,19 @@ def assert_no_shuffle_tables():
         assert node.query("SHOW TABLES LIKE '_shuffle_%'") == ""
 
 
+def query_log_profile_event_sum(node, query_id, event_name):
+    return int(
+        node.query(
+            f"""
+            SELECT sum(ProfileEvents['{event_name}'])
+            FROM system.query_log
+            WHERE type = 'QueryFinish'
+              AND startsWith(query_id, '{query_id}:shuffle:')
+            """
+        ).strip()
+    )
+
+
 def test_inner_all_join_uses_push_based_shuffle(started_cluster):
     query = """
         SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
@@ -95,6 +108,75 @@ def test_inner_all_join_using_key_uses_push_based_shuffle(started_cluster):
         "3\tl3_node2\tr3_node1",
         "4\tl4_node2\tr4_node1",
     ]
+    assert_no_shuffle_tables()
+
+
+def test_exchange_profile_events_are_logged(started_cluster):
+    query_id = f"shuffle_profile_events_{uuid.uuid4().hex}"
+    query = """
+        SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+            log_queries = 1
+    """
+
+    result = node1.query(query, query_id=query_id)
+
+    assert sorted_tsv(result) == [
+        "1\tl1_node1\tr1_node2",
+        "2\tl2_node1\tr2_node2",
+        "3\tl3_node2\tr3_node1",
+        "4\tl4_node2\tr4_node1",
+    ]
+
+    for node in (node1, node2):
+        node.query("SYSTEM FLUSH LOGS query_log")
+
+    exchange_input_rows = sum(
+        query_log_profile_event_sum(
+            node, query_id, "DistributedShuffleJoinExchangeInputRows"
+        )
+        for node in (node1, node2)
+    )
+    exchange_output_rows = sum(
+        query_log_profile_event_sum(
+            node, query_id, "DistributedShuffleJoinExchangeOutputRows"
+        )
+        for node in (node1, node2)
+    )
+    local_output_rows = sum(
+        query_log_profile_event_sum(
+            node, query_id, "DistributedShuffleJoinLocalOutputRows"
+        )
+        for node in (node1, node2)
+    )
+    remote_output_rows = sum(
+        query_log_profile_event_sum(
+            node, query_id, "DistributedShuffleJoinRemoteOutputRows"
+        )
+        for node in (node1, node2)
+    )
+    exchange_input_bytes = sum(
+        query_log_profile_event_sum(
+            node, query_id, "DistributedShuffleJoinExchangeInputBytes"
+        )
+        for node in (node1, node2)
+    )
+    exchange_output_bytes = sum(
+        query_log_profile_event_sum(
+            node, query_id, "DistributedShuffleJoinExchangeOutputBytes"
+        )
+        for node in (node1, node2)
+    )
+
+    assert exchange_input_rows > 0
+    assert exchange_output_rows == exchange_input_rows
+    assert local_output_rows > 0
+    assert remote_output_rows > 0
+    assert local_output_rows + remote_output_rows == exchange_output_rows
+    assert exchange_input_bytes > 0
+    assert exchange_output_bytes > 0
     assert_no_shuffle_tables()
 
 

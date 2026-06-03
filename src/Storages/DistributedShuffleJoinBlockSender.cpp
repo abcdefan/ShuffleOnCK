@@ -2,6 +2,7 @@
 
 #include <Client/ConnectionPoolWithFailover.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <IO/ConnectionTimeouts.h>
 #include <Interpreters/Cluster.h>
@@ -12,6 +13,16 @@
 #include <Processors/Executors/PushingPipelineExecutor.h>
 #include <Processors/Sinks/RemoteSink.h>
 #include <QueryPipeline/QueryPipeline.h>
+
+namespace ProfileEvents
+{
+    extern const Event DistributedShuffleJoinLocalOutputBlocks;
+    extern const Event DistributedShuffleJoinLocalOutputRows;
+    extern const Event DistributedShuffleJoinLocalOutputBytes;
+    extern const Event DistributedShuffleJoinRemoteOutputBlocks;
+    extern const Event DistributedShuffleJoinRemoteOutputRows;
+    extern const Event DistributedShuffleJoinRemoteOutputBytes;
+}
 
 namespace DB
 {
@@ -75,6 +86,8 @@ void ClusterDistributedShuffleJoinBlockSender::sendBlock(
     if (!block.rows())
         return;
 
+    const auto rows = block.rows();
+    const auto bytes = block.bytes();
     auto & job = getOrCreateJob(table_names, target_shard_index, side);
     if (job.finished)
     {
@@ -86,6 +99,20 @@ void ClusterDistributedShuffleJoinBlockSender::sendBlock(
     }
 
     job.executor->push(std::move(block));
+
+    const auto & shard_info = cluster->getShardsInfo()[target_shard_index];
+    if (shard_info.isLocal())
+    {
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinLocalOutputBlocks);
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinLocalOutputRows, rows);
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinLocalOutputBytes, bytes);
+    }
+    else
+    {
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinRemoteOutputBlocks);
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinRemoteOutputRows, rows);
+        ProfileEvents::increment(ProfileEvents::DistributedShuffleJoinRemoteOutputBytes, bytes);
+    }
 }
 
 void ClusterDistributedShuffleJoinBlockSender::finish(

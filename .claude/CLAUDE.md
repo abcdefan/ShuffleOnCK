@@ -592,12 +592,20 @@ integration tests 至少覆盖：
    - cluster Local `JOIN` result plan 会在所有 target shard 结果汇聚到 initiator 后增加 `SortingStep`，随后再执行已有 `LimitStep`；因此 `ORDER BY ... LIMIT ... OFFSET ...` 的排序与截断都具有全局语义。
    - 新增 `ExecutionPlanCarriesGlobalOrderBy` gtest 和真实 integration 查询 `ORDER BY id DESC LIMIT 2 OFFSET 1`。本轮 `DistributedShuffleJoin.*` gtest 为 45 个且全部通过，完整 Praktika `test_distributed_shuffle_join` 为 `14 passed in 30.68s`。
 
-11. 增加了大右表场景的四路径性能对比基准和报告。
+11. 增加了三条真实用户查询路径的受控性能基准和报告。
 
-   - 新增手动启用的 `tests/integration/test_distributed_shuffle_join_performance`，在三 shard 上生成未按 `JOIN` key 预落位的左表 30,000 行和右表 6,000,000 行，并先比较输出 key 保证四条路径结果一致。
-   - 基准比较内置 `GLOBAL INNER ALL JOIN`、`distributed_product_mode = 'allow'`、当前 `distributed_shuffle_join = 1` 真实路径，以及按旧 `shuffle` 分支提交 `e5c716ce9093` 中 bucket rewrite 逻辑复刻的三节点并行 SQL 分桶路径；最后一项不是旧分支二进制的直接运行结果。
-   - 本地 `Debug` build、三次计时中位数分别为当前 push-based shuffle `1.270s`、旧 SQL 分桶复刻 `1.336s`、`GLOBAL JOIN` `2.073s`、`allow` `2.229s`；详细环境、SQL、原始计时和限制见 `shuffle_join_performance_comparison.md`。
-   - Praktika 手动基准运行通过，结果为 `1 passed in 301.27s`，日志见 `build/test_distributed_shuffle_join_performance_comparison_recorded.log`，机器可读结果见 `build/distributed_shuffle_join_performance_results.json`。
+   - 新增手动启用的 `tests/integration/test_distributed_shuffle_join_performance`，比较当前 `distributed_shuffle_join = 1`、内置 `GLOBAL INNER ALL JOIN` 与 `distributed_product_mode = 'allow'` 三条真实 SQL 路径。
+   - 脚本默认 workload 为 `30,000 x 1,000,000` 且使用 `max_threads = 2`；正确性阶段最多拉回 10,000 个确定性 key 比较，性能阶段仍执行完整输入和 projection；预计匹配输出超过 1,000,000 行时默认拒绝执行。
+   - 本地 `Debug` build 上运行四个五轮场景：小小 `30,000 x 30,000` 和中中 `250,000 x 250,000` 时当前 shuffle 中位数分别为 `0.316s`、`0.315s`，慢于另外两条路径；大大 `2,000,000 x 2,000,000` 时当前 shuffle `0.818s`，比 `GLOBAL JOIN` `0.918s` 快 `11.0%`，比 `allow` `0.971s` 快 `15.8%`；小大 `30,000 x 6,000,000` 时当前 shuffle `1.269s`，比 `GLOBAL JOIN` `2.223s` 快 `42.9%`，比 `allow` `1.822s` 快 `30.4%`。
+   - `2,000,000 x 2,000,000` 仅在明确设置 `CLICKHOUSE_SHUFFLE_PERF_ALLOW_LARGE_OUTPUT=1` 后运行，脚本默认的 1,000,000 行输出保护仍保留。新增两次大规模 Praktika 运行全部通过，结束后本机可用内存回到约 13 GiB。结果说明当前 Exchange 路径需要 cost model，而不能对所有满足语义条件的查询无条件启用；详细数据见 `tests/docs/distributed_shuffle_join_performance_comparison.md`。
+
+12. 增加了 `distributed_shuffle_join` Exchange 的基础 `ProfileEvents`。
+
+   - `DistributedShuffleJoinSink` 现在记录进入 Exchange sink 的非空 block 数、行数和内存字节数：`DistributedShuffleJoinExchangeInputBlocks`、`DistributedShuffleJoinExchangeInputRows`、`DistributedShuffleJoinExchangeInputBytes`。
+   - `DistributedShuffleJoinSink` 还会记录按目标 shard 拆分后的非空 block 数、行数和内存字节数：`DistributedShuffleJoinExchangeOutputBlocks`、`DistributedShuffleJoinExchangeOutputRows`、`DistributedShuffleJoinExchangeOutputBytes`。
+   - `ClusterDistributedShuffleJoinBlockSender` 在 block 成功交给目标 insert pipeline 后，按本地短路和远端发送分别记录 `DistributedShuffleJoinLocalOutput*` 与 `DistributedShuffleJoinRemoteOutput*` 三组 block/row/byte 事件，后续可通过 profile events 或聚合 `system.query_log` 中相关 internal query 观察 shuffle 数据量及本地/远端比例。
+   - 新增 `SinkRecordsExchangeProfileEvents` gtest，验证单个 4 行 block 在 2 shard 下会被记录为 1 个 input block、2 个 output block、4 行和 32 字节。`DistributedShuffleJoin.*` gtest 当前为 46 个且全部通过。
+   - 新增真实 integration case `test_exchange_profile_events_are_logged`，用普通用户 `SELECT ... SETTINGS distributed_shuffle_join = 1` 触发完整路径，然后从 `system.query_log` 聚合该 query 派生出的 shuffle internal query，确认 Exchange input/output rows 一致、本地和远端 output rows 都有记录、且 byte 事件非零。由于 `query_log` 事件归属受 internal query 边界影响，integration 只验证稳定不变量，不把全局总行数硬编码成断言。
 
 当前已实现能力对应的真实 SQL 例子：
 
@@ -828,7 +836,14 @@ SETTINGS distributed_shuffle_join = 1
 - `CCACHE_DISABLE=1 ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含全局 `ORDER BY` 支持的真实 server 与 unit test binary 通过，日志见 `build/build_shuffle_join_global_order.log`。
 - `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证全局 sort execution plan 传递和现有路径，45 个用例全部通过，日志见 `build/test_distributed_shuffle_join_global_order.log`。
 - `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR`，并通过本地 Docker image tar 运行完整 Praktika integration，包含全局 `ORDER BY`、`LIMIT` / `OFFSET` 与恢复节点 opportunistic TTL cleanup 的十四个 `test_distributed_shuffle_join` 用例全部通过，结果为 `14 passed in 30.68s`，日志见 `build/test_integration_distributed_shuffle_join_global_order.log`。
-- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR`，并通过本地 Docker image tar 显式启用三 shard 大右表性能场景，四条 `JOIN` 路径结果一致且基准执行通过，结果为 `1 passed in 301.27s`，日志见 `build/test_distributed_shuffle_join_performance_comparison_recorded.log`，详细对比见 `shuffle_join_performance_comparison.md`。
+- `/usr/bin/python3 -c '...'` 以三路径受控性能脚本、`max_threads = 2` 和 10,000 行正确性样本运行五轮小表 `JOIN` 小表 `30,000 x 30,000`，结果为 `1 passed in 24.37s`，日志见 `build/test_distributed_shuffle_join_three_modes_small_small.log`。
+- `/usr/bin/python3 -c '...'` 以相同设置运行五轮中表 `JOIN` 中表 `250,000 x 250,000`，结果为 `1 passed in 25.94s`，日志见 `build/test_distributed_shuffle_join_three_modes_medium_medium.log`。
+- `/usr/bin/python3 -c '...'` 以相同线程和正确性样本设置，显式设置 `CLICKHOUSE_SHUFFLE_PERF_ALLOW_LARGE_OUTPUT=1` 后运行五轮大表 `JOIN` 大表 `2,000,000 x 2,000,000`，结果为 `1 passed in 55.92s`，日志见 `build/test_distributed_shuffle_join_three_modes_large_large_2m.log`。
+- `/usr/bin/python3 -c '...'` 以相同设置运行五轮小表 `JOIN` 大表 `30,000 x 6,000,000`，结果为 `1 passed in 76.05s`，日志见 `build/test_distributed_shuffle_join_three_modes_small_large_6m.log`。
+- `ninja -C build src/unit_tests_dbms` 编译包含 `distributed_shuffle_join` profile events 的 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_profile_events.log`；沙箱内第一次运行因 `ccache` 写缓存报只读文件系统失败，随后在沙箱外同命令重跑通过。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证新增 profile events 计数和现有路径，46 个用例全部通过，日志见 `build/test_distributed_shuffle_join_profile_events.log`。
+- `ninja -C build programs/clickhouse` 编译包含 profile events integration 覆盖所需的真实 server 二进制通过，日志见 `build/build_distributed_shuffle_join_profile_events_integration.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_profile_events_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_exchange_profile_events_are_logged` 后 15 个用例全部通过，结果为 `15 passed in 30.94s`，日志见 `build/test_integration_distributed_shuffle_join_profile_events.log`。期间一次 targeted selector `test_distributed_shuffle_join::test_exchange_profile_events_are_logged` 因 Praktika integration selector 不支持 pytest `::` 形式失败，一次未传本地 image 参数导致 Docker pull infra error，最终用 `--test test_distributed_shuffle_join` 和 `CLICKHOUSE_TESTS_SKIP_DOCKER_PULL=1` / `CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR=...` 通过。
 - 手动使用 `tests/integration/test_distributed_shuffle_join/_instances-gw0` 下的 compose 文件和 `--pull never` 启动本地已有镜像，执行 integration 中同样的建表、插入、`distributed_shuffle_join = 1` 查询和 cleanup 检查已通过，日志见 `build/manual_distributed_shuffle_join_query.log`、`build/manual_distributed_shuffle_join_where_query.log`、`build/manual_distributed_shuffle_join_node1_shuffle_tables.log` 和 `build/manual_distributed_shuffle_join_node2_shuffle_tables.log`。
 
 当前代码还没有完成的部分：

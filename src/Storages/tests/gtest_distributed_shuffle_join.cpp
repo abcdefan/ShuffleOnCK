@@ -6,6 +6,8 @@
 
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
+#include <Common/CurrentThread.h>
+#include <Common/ProfileEvents.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Block.h>
 #include <Core/Settings.h>
@@ -29,6 +31,16 @@
 #include <array>
 #include <mutex>
 #include <optional>
+
+namespace ProfileEvents
+{
+    extern const Event DistributedShuffleJoinExchangeInputBlocks;
+    extern const Event DistributedShuffleJoinExchangeInputRows;
+    extern const Event DistributedShuffleJoinExchangeInputBytes;
+    extern const Event DistributedShuffleJoinExchangeOutputBlocks;
+    extern const Event DistributedShuffleJoinExchangeOutputRows;
+    extern const Event DistributedShuffleJoinExchangeOutputBytes;
+}
 
 namespace DB
 {
@@ -425,6 +437,35 @@ TEST(DistributedShuffleJoin, SinkPartitionsBlocksForShuffleTables)
     EXPECT_EQ(sender->getFinishCount(0, DistributedShuffleJoinTableSide::Right), 2);
     EXPECT_EQ(sender->getFinishCount(1, DistributedShuffleJoinTableSide::Right), 2);
     EXPECT_FALSE(sender->wasCancelled());
+}
+
+TEST(DistributedShuffleJoin, SinkRecordsExchangeProfileEvents)
+{
+    CurrentThread::getProfileEvents().reset();
+
+    auto sender = std::make_shared<CapturingShuffleTableBlockSender>(2);
+    auto selector = createDistributedShuffleJoinSelector(makeTwoShardCluster(), "id");
+
+    const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "profile-events-test", .join_id = 0};
+    const auto table_names = createDistributedShuffleJoinTableNames("default", exchange_id);
+    auto sink = DistributedShuffleJoinSink(
+        makeHeader(),
+        table_names,
+        /*target_shard_count_=*/2,
+        DistributedShuffleJoinTableSide::Left,
+        selector,
+        sender);
+
+    auto chunk = makeChunk({1, 2, 3, 4});
+    sink.consume(chunk);
+
+    const auto & profile_events = CurrentThread::getProfileEvents();
+    EXPECT_EQ(profile_events[ProfileEvents::DistributedShuffleJoinExchangeInputBlocks], 1);
+    EXPECT_EQ(profile_events[ProfileEvents::DistributedShuffleJoinExchangeInputRows], 4);
+    EXPECT_EQ(profile_events[ProfileEvents::DistributedShuffleJoinExchangeInputBytes], 32);
+    EXPECT_EQ(profile_events[ProfileEvents::DistributedShuffleJoinExchangeOutputBlocks], 2);
+    EXPECT_EQ(profile_events[ProfileEvents::DistributedShuffleJoinExchangeOutputRows], 4);
+    EXPECT_EQ(profile_events[ProfileEvents::DistributedShuffleJoinExchangeOutputBytes], 32);
 }
 
 TEST(DistributedShuffleJoin, ClusterLayoutEligibilityMatchesMvpScope)
