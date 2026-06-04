@@ -180,13 +180,13 @@ This section records the current plan for implementing real distributed `shuffle
 
 - `enable_analyzer = 1`。
 - 实验开关使用当前代码里的 `distributed_shuffle_join`，设计文档里的 `enable_shuffle_join` 先理解为同一个能力的外部命名。
-- `INNER ALL JOIN`。
+- `INNER ALL JOIN`、`INNER ANY JOIN`、`LEFT ALL JOIN`、`LEFT ANY JOIN`、`RIGHT ALL JOIN`、`RIGHT ANY JOIN`、`FULL ALL JOIN`、`LEFT SEMI JOIN`、`LEFT ANTI JOIN`、`RIGHT SEMI JOIN` 和 `RIGHT ANTI JOIN`。
 - 单个等值 `JOIN` key，例如 `USING (id)` 或简单 `ON a.id = b.id`。
 - 左右两边都是直接的 `StorageDistributed` 表。
 - 左右两边属于同一个 `cluster`。
 - 每个 shard 只使用一个 replica，暂时不支持 parallel replicas。
 - shuffle 中间数据使用普通 `Memory` 表，数据超限可以先报错。
-- 暂时不支持 spill、复杂子查询、多 key、多种 `JOIN` strictness、`LEFT` / `RIGHT` / `FULL` / `ASOF` / `SEMI` / `ANTI` 等复杂语义。
+- 暂时不支持 spill、复杂子查询、多 key、`FULL ANY` / `ASOF` 等复杂语义。
 
 ### 执行流程
 
@@ -364,7 +364,7 @@ integration tests 至少覆盖：
   - `createDistributedShuffleJoinExchangeHeader` 根据 `DistributedShuffleJoinInfo` 和 side 生成 left/right shuffle 输入 header。
   - `createDistributedShuffleJoinExchangeSourceQuery` 根据 required columns 和本地表名生成 source shard 本地读取 SQL。
   - `createDistributedShuffleJoinExchangeSourceQuery` 也可以直接从 `DistributedShuffleJoinInfo` 中的 left/right `StorageDistributed` 取 remote database/table 来生成本地读取 SQL。
-  - `createDistributedShuffleJoinLocalJoinQuery` 根据 `_shuffle_*` 表名和 left/right key 列生成 target shard 上执行的本地 `INNER ALL JOIN` SQL。
+  - `createDistributedShuffleJoinLocalJoinQuery` 根据 `_shuffle_*` 表名、left/right key 列以及 analyzer 提取出的 kind/strictness，生成 target shard 上执行的本地 `INNER ALL JOIN`、`INNER ANY JOIN`、`LEFT ALL JOIN`、`LEFT ANY JOIN`、`RIGHT ALL JOIN`、`RIGHT ANY JOIN`、`FULL ALL JOIN`、`LEFT SEMI JOIN`、`LEFT ANTI JOIN`、`RIGHT SEMI JOIN` 或 `RIGHT ANTI JOIN` SQL。
   - `createDistributedShuffleJoinRemoteExchangeQuery` 生成 initiator 后续可发给远端 source shard 的内部 `SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE ...` 命令。
   - `createDistributedShuffleJoinExchangeSink` 根据 analyzer 输出、cluster、table names、side 和 sender 创建对应的 `DistributedShuffleJoinSink`。
   - `executeDistributedShuffleJoinExchangeQuery` 会执行内部 source query，并把输出 pipeline 接到对应的 `DistributedShuffleJoinSink`。
@@ -412,7 +412,7 @@ integration tests 至少覆盖：
 1. 功能开关和资格分析
 
    - 已有实验 setting `distributed_shuffle_join`，默认关闭。
-   - 已有 `DistributedShuffleJoinAnalyzer`，用于判断 MVP 查询是否能走 `shuffle join`：目前目标是 `enable_analyzer = 1`、左右都是直接 `StorageDistributed`、同 cluster、简单等值 `INNER ALL JOIN`。
+   - 已有 `DistributedShuffleJoinAnalyzer`，用于判断 MVP 查询是否能走 `shuffle join`：目前目标是 `enable_analyzer = 1`、左右都是直接 `StorageDistributed`、同 cluster、简单等值 `INNER ALL JOIN`、`INNER ANY JOIN`、`LEFT ALL JOIN`、`LEFT ANY JOIN`、`RIGHT ALL JOIN`、`RIGHT ANY JOIN`、`FULL ALL JOIN`、`LEFT SEMI JOIN`、`LEFT ANTI JOIN`、`RIGHT SEMI JOIN` 或 `RIGHT ANTI JOIN`。
    - analyzer 已经提取 left/right 直接 key 列名；`ON` 形态目前收窄为左右两侧直接列等值条件，复杂表达式 key 仍不走 MVP 路径。
    - analyzer 现在会保守拒绝 `enable_parallel_replicas` 已开启、匿名/非具名 cluster、左右 shard 数不一致、或任意 shard 含多个 replica 的场景，避免 MVP 路径误处理 parallel replicas / replica 选择语义。
    - analyzer 现在支持有限的 `WHERE` 拆分：`AND` 拆分后的每个 deterministic 子条件如果只引用左表或右表一侧，会进入对应 side 的 source query；如果同时引用左右两侧，会转换成带 `_shuffle_left` / `_shuffle_right` 前缀的 post-join filter，拼到 target shard 的本地 `JOIN` SQL。
@@ -472,7 +472,7 @@ integration tests 至少覆盖：
    - analyzer 现在能接受直接 `QueryNode`，也能接受 analyzer 为普通单条 `SELECT` 包出来的单 query `UnionNode`；多 query `UNION` 仍然不会走 MVP 路径。
    - analyzer 输出现在包含简单直接列 projection；本地 `JOIN` SQL 会按用户原始输出列生成 `SELECT` 列表，而不是固定 `SELECT *`。
    - analyzer 输出现在也支持 deterministic projection expression，例如 `l.id + r.id AS sum_id`；表达式会转换为 target shard 本地 `JOIN` SQL 中带 `_shuffle_left` / `_shuffle_right` 前缀的表达式。聚合、子查询和复杂非 deterministic 表达式仍然保守拒绝。
-   - analyzer 现在会保守拒绝尚未实现语义的 query clauses，包括 `WITH`、`DISTINCT`、`PREWHERE`、`GROUP BY`、`HAVING`、window/`QUALIFY`、`ORDER BY ALL`、`ORDER BY ... WITH FILL`、带 collation 的排序、隐藏排序表达式、`LIMIT BY` 和 `LIMIT WITH TIES` 等；按已输出 deterministic 表达式的全局 `ORDER BY`，以及已归一化为非负整数常量的普通 `LIMIT` 与可选 `OFFSET` 已可进入 shuffle 路径。
+   - analyzer 现在会保守拒绝尚未实现语义的 query clauses，包括 `WITH`、`DISTINCT`、`PREWHERE`、`GROUP BY`、`HAVING`、window/`QUALIFY`、`ORDER BY ALL`、`ORDER BY ... WITH FILL`、带 collation 的排序和 `LIMIT BY` 等；按 deterministic 表达式的全局 `ORDER BY` 已可进入 shuffle 路径，排序表达式不在最终 `SELECT` 输出中时会通过隐藏辅助列完成排序并在最终结果前裁掉；已归一化为非负整数常量的普通 `LIMIT` / `OFFSET` 以及带 `ORDER BY` 的 `LIMIT WITH TIES` 也已支持。
    - 已有 `executeDistributedShuffleJoinStages`，可以把 execution plan、query executor、Exchange executor 和 Local `JOIN` executor 串成 `Prepare -> Exchange -> Local JOIN -> Cleanup` 阶段调用。
    - 已有 `prepareDistributedShuffleJoinExchange`，可以把 `Prepare -> Exchange` 和结果读取生命周期分开，避免真实 `SELECT` 返回结果前过早 cleanup。
    - 已有 `holdDistributedShuffleJoinCoordinator` 和 `attachDistributedShuffleJoinCoordinator`，可以把 cleanup 生命周期挂到 `QueryPlanResourceHolder` 或直接 attach 到结果 `QueryPipeline`；真实 pipeline 路径还可以同时持有 owned query executor，避免 cleanup 时 coordinator 引用的 executor 提前析构。
@@ -482,7 +482,7 @@ integration tests 至少覆盖：
    - 已有 `executeDistributedShuffleJoinPipeline`，可以从 `DistributedShuffleJoinInfo` 和 `Context` 直接执行完整 `Prepare -> Exchange -> cluster Local JOIN result pipeline`，并把 query executor/coordinator 生命周期挂到结果 pipeline 上。
    - 已有 `DistributedShuffleJoinExchangePipeline` helper，可以根据 `DistributedShuffleJoinInfo` 为 left/right side 生成 source query、创建带正确 header/selector/table names 的 sink，也可以把内部 source query 的输出接到这个 sink 执行。
    - Exchange source query pipeline 会把上层 cancellation callback 转发给其内部 `QueryStatus`；外层 query 被取消或 initiator 客户端断连时，正在运行的 source 表读取和表达式计算能够被中断，而不是等待自然结束。
-   - Exchange source query 会把 analyzer 得到的 left/right filter condition 拼到对应本地 source SQL 的 `WHERE`，从发送端提前减少 shuffle 数据；Local `JOIN` SQL 会把 analyzer 得到的 post-join filter condition 拼到 target shard 本地 `JOIN` 后。
+   - Exchange source query 会把 analyzer 得到的 left/right filter condition 拼到对应本地 source SQL 的 `WHERE`，从发送端提前减少 shuffle 数据；Local `JOIN` SQL 会把 analyzer 得到的 post-join filter condition 拼到 target shard 本地 `JOIN` 后。`LEFT JOIN` 下只会下推左表条件，右表条件必须保留到 post-join filter；`RIGHT JOIN` 下规则相反，只下推右表条件，左表条件保留到 post-join filter；`FULL JOIN` 下所有 `WHERE` 条件都保留到 post-join filter，避免破坏左右两侧保留行语义；`LEFT/RIGHT SEMI` 和 `LEFT/RIGHT ANTI` 只允许输出侧 projection/filter，非输出侧条件需要用户显式写成 source 子查询，MVP 直接拒绝。
    - 已有远端 source Exchange JSON payload helpers，可以序列化/反序列化 cluster、source 表、`_shuffle_*` 表名、key、columns 和 left/right filter condition，并从 payload 还原执行 Exchange 所需的 `DistributedShuffleJoinInfo`。
    - 每个内部 Exchange 在写入当前 query 的 bucket 前会扫描相同 database 中带过期标记的旧表，best-effort 删除已过期的 `Memory` shuffle 表；扫描先释放 table iterator，再通过 `InterpreterDropQuery` 自己的 `DDLGuard` 删除表，避免 iterator 持锁和重复 guard 自锁。因此恢复后再次参与 shuffle 的 shard 能自行回收残表。当前扫描不会在完全空闲的 shard 上周期触发。
    - 已有 source shard 本地 Exchange 封装：顺序执行 left/right 两侧，任一侧失败会 cancel sender，避免留下未收口的写入 pipeline。
@@ -504,18 +504,18 @@ integration tests 至少覆盖：
 8. 测试覆盖
 
    - 已有 `DistributedShuffleJoin.*` gtest。
-   - 当前覆盖 selector 分桶、从 analyzer info 创建 selector、cluster layout MVP 边界判断、Exchange side sink 创建、Exchange source SQL 生成、Exchange source `WHERE` 下推、post-join filter 的 Local `JOIN` SQL 生成、deterministic projection expression 的 Local `JOIN` SQL 生成、全局 `LIMIT` / `OFFSET` 与 `ORDER BY` execution plan 传递、缺失 source storage 保护、远端 Exchange payload 序列化/反序列化、执行计划生成、query id 缺失时的唯一 fallback 表名前缀、完整阶段顺序执行、`Prepare -> Exchange` 生命周期拆分、coordinator resource 析构 cleanup、owned query executor/coordinator resource 输入保护、coordinator resource attach 到 `QueryPipeline` 后 cleanup、Local `JOIN` pipeline 失败 cleanup、cluster Local `JOIN` pipeline 失败 cleanup、完整 pipeline 入口输入保护、source shard left/right 执行顺序、source shard Exchange 失败 cancel、当前 shard Exchange executor、system-query Exchange executor 保护、当前 shard Exchange executor 工厂校验、远端 Exchange 内部 `SYSTEM` 命令生成和解析、普通用户直接执行内部 `SYSTEM` 命令会被拒绝、`_shuffle_*` 表名和 SQL 生成、带 projection 的 Local `JOIN` SQL 生成、required columns 到 header 的转换、coordinator prepare/exchange/local join/cleanup、prepare 失败清理、cleanup `DROP` 失败后继续回收其他 shard、Exchange 失败清理、Local `JOIN` 失败清理。
-   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，45 个测试全部成功。
-   - 已新增 `tests/integration/test_distributed_shuffle_join`，用两个 shard 的真实 `Distributed` 表跑 `INNER ALL JOIN`，数据故意不按 `JOIN` key 落位，并在查询后检查 `_shuffle_*` 表已清理；其中同时验证了 `ON l.id = r.id` 和 `USING (id)` 两种 MVP key 写法，以及 `WHERE l.id >= 2 AND r.id <= 3` 这类可下推到单表 source 的过滤。
+   - 当前覆盖 selector 分桶、从 analyzer info 创建 selector、cluster layout MVP 边界判断、Exchange side sink 创建、Exchange source SQL 生成、Exchange source `WHERE` 下推、post-join filter 的 Local `JOIN` SQL 生成、deterministic projection expression 的 Local `JOIN` SQL 生成、隐藏 `ORDER BY` 辅助列的 Local `JOIN` SQL 和最终 projection metadata、全局 `LIMIT` / `OFFSET` / `LIMIT WITH TIES` 与 `ORDER BY` execution plan 传递、`INNER ANY JOIN`、`SEMI JOIN`、`ANTI JOIN` strictness 以及 `LEFT JOIN` / `RIGHT JOIN` / `FULL JOIN` kind 到 Local `JOIN` SQL 的传递、缺失 source storage 保护、远端 Exchange payload 序列化/反序列化、执行计划生成、query id 缺失时的唯一 fallback 表名前缀、完整阶段顺序执行、`Prepare -> Exchange` 生命周期拆分、coordinator resource 析构 cleanup、owned query executor/coordinator resource 输入保护、coordinator resource attach 到 `QueryPipeline` 后 cleanup、Local `JOIN` pipeline 失败 cleanup、cluster Local `JOIN` pipeline 失败 cleanup、完整 pipeline 入口输入保护、source shard left/right 执行顺序、source shard Exchange 失败 cancel、当前 shard Exchange executor、system-query Exchange executor 保护、当前 shard Exchange executor 工厂校验、远端 Exchange 内部 `SYSTEM` 命令生成和解析、普通用户直接执行内部 `SYSTEM` 命令会被拒绝、`_shuffle_*` 表名和 SQL 生成、带 projection 的 Local `JOIN` SQL 生成、required columns 到 header 的转换、coordinator prepare/exchange/local join/cleanup、prepare 失败清理、cleanup `DROP` 失败后继续回收其他 shard、Exchange 失败清理、Local `JOIN` 失败清理。
+   - 最近一次运行 `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 通过，53 个测试全部成功。
+   - 已新增 `tests/integration/test_distributed_shuffle_join`，用两个 shard 的真实 `Distributed` 表跑 `INNER ALL JOIN`，数据故意不按 `JOIN` key 落位，并在查询后检查 `_shuffle_*` 表已清理；其中同时验证了 `ON l.id = r.id` 和 `USING (id)` 两种 MVP key 写法，以及 `WHERE l.id >= 2 AND r.id <= 3` 这类可下推到单表 source 的过滤。integration 也覆盖了右表重复 key 的 `ANY INNER JOIN`，确认 shuffle 路径不会退化成 `ALL JOIN` 多返回重复行。
    - integration 会使用外层 query id 派生出的 source query id 检查两个 source shard 的 `system.query_log`，确认每个 shard 对 left/right 本地源表各只扫描一次。
    - integration 现在也覆盖 `distributed_shuffle_join = 0` 时保留普通 distributed `JOIN` 的默认 exception 行为且不创建 `_shuffle_*` 表，以及 `l.id + r.id >= 6` 这类 post-join filter 和 `l.id + r.id AS sum_id` 这类 expression projection 通过 shuffle Local `JOIN` SQL 执行并返回正确结果。
-   - integration 已覆盖无排序的 `LIMIT 2 OFFSET 1` 查询，用固定投影值验证全局汇聚后只返回两行；同时覆盖 `ORDER BY id DESC LIMIT 2 OFFSET 1`，验证四条跨 shard 匹配结果在 initiator 排序和截断后按顺序返回 `id = 3, 2`。
+   - integration 已覆盖无排序的 `LIMIT 2 OFFSET 1` 查询，用固定投影值验证全局汇聚后只返回两行；同时覆盖 `ORDER BY id DESC LIMIT 2 OFFSET 1`，验证四条跨 shard 匹配结果在 initiator 排序和截断后按顺序返回 `id = 3, 2`；还覆盖 `SELECT` 不输出排序 key、但按 `l.id` 全局排序的隐藏 `ORDER BY` 查询，确认排序辅助列不会出现在最终结果中。
    - integration 现在覆盖真实错误清理路径：远端 source shard 缺少本地源表导致 Exchange 失败时会清理 `_shuffle_*` 表；target shard 在 Local `JOIN` 输出表达式中抛 exception 时也会清理 `_shuffle_*` 表。
    - integration 现在覆盖用户取消路径：在 target shard 已开始读取 `_shuffle_*` 执行 Local `JOIN` 后取消外层 query，返回 `QUERY_WAS_CANCELLED` 且所有 `_shuffle_*` 表被清理；也覆盖 source shard 正在执行含 `sleepEachRow(30)` 的 Exchange 读取时使用 `KILL QUERY ... ASYNC` 取消，要求查询在 10 秒内返回并清理所有 `_shuffle_*` 表。
    - integration 现在覆盖 initiator 客户端断连路径：source shard 正在执行含 `sleepEachRow(30)` 的 Exchange 读取时直接终止 client 进程，初始查询会收到客户端断连 `ABORTED` exception 并清理所有 `_shuffle_*` 表。
    - integration 覆盖远端 cleanup 不可达及恢复回收路径：在 Exchange 已创建两侧 `_shuffle_*` 表后停止远端 shard 并取消外层 query，可达的 initiator shard 仍完成 cleanup；远端恢复后先观察到两张残留 `Memory` 表，等待 TTL 后执行 recovery shuffle 会自动删除残表，并保留名称形似过期 shuffle 表的 `MergeTree` 用户表。
    - 当前本地已经用 integration helper 生成的 compose 文件和本地已有 `clickhouse/integration-test:5bb2dd37392781717bda` 镜像手动跑通两节点 demo：普通 `INNER ALL JOIN` 返回 4 行正确结果，带 `WHERE l.id >= 2 AND r.id <= 3` 的查询返回 2 行正确结果，两个节点查询后都没有残留 `_shuffle_*` 表。
-   - 当前本地已经跑通完整 Praktika integration job。由于本机默认 `ci/tmp` 是旧 Docker 产物且 Docker Hub 拉取超时，本地运行时使用 `/usr/bin/python3` 临时覆盖 `Settings.TEMP_DIR`，并通过 `CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR` 将宿主机已有的 `clickhouse/integration-test:5bb2dd37392781717bda` 镜像导入 Praktika 的 Docker-in-Docker 环境；`test_distributed_shuffle_join` 十四个 pytest 用例全部通过，最近结果为 `14 passed in 30.68s`。
+   - 当前本地已经跑通完整 Praktika integration job。由于本机默认 `ci/tmp` 是旧 Docker 产物且 Docker Hub 拉取超时，本地运行时使用 `/usr/bin/python3` 临时覆盖 `Settings.TEMP_DIR`，并通过 `CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR` 将宿主机已有的 `clickhouse/integration-test:5bb2dd37392781717bda` 镜像导入 Praktika 的 Docker-in-Docker 环境；`test_distributed_shuffle_join` 二十二个 pytest 用例全部通过，最近结果为 `22 passed in 43.99s`。
    - `ci/jobs/integration_test_job.py` 和 `tests/integration/helpers/cluster.py` 新增默认关闭的本地测试开关：`CLICKHOUSE_TESTS_SKIP_DOCKER_PULL=1` 时跳过 integration image prefetch 和 per-cluster `docker compose pull`，ClickHouse cluster `compose up` 会带 `--pull never`；`CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR=<path>` 时 Praktika job 会先执行 `docker load -i <path>`。CI 默认行为不变。
 
 ### 首次端到端跑通后的完善记录（持续追加）
@@ -607,6 +607,60 @@ integration tests 至少覆盖：
    - 新增 `SinkRecordsExchangeProfileEvents` gtest，验证单个 4 行 block 在 2 shard 下会被记录为 1 个 input block、2 个 output block、4 行和 32 字节。`DistributedShuffleJoin.*` gtest 当前为 46 个且全部通过。
    - 新增真实 integration case `test_exchange_profile_events_are_logged`，用普通用户 `SELECT ... SETTINGS distributed_shuffle_join = 1` 触发完整路径，然后从 `system.query_log` 聚合该 query 派生出的 shuffle internal query，确认 Exchange input/output rows 一致、本地和远端 output rows 都有记录、且 byte 事件非零。由于 `query_log` 事件归属受 internal query 边界影响，integration 只验证稳定不变量，不把全局总行数硬编码成断言。
 
+13. 放开了不在最终输出中的隐藏 `ORDER BY` 表达式。
+
+   - `DistributedShuffleJoinAnalyzer` 现在遇到 `ORDER BY` 表达式未命中用户 projection 时，会在 Local `JOIN` projection 中追加 `_shuffle_order_by_N` 隐藏辅助列，并让 `SortDescription` 按该内部列排序；已出现在 projection 中的排序表达式仍复用原结果列名。
+   - cluster Local `JOIN` result plan 在 `SortingStep` 和可选 `LimitStep` 后，如果存在隐藏辅助列，会追加 `ExpressionStep` 只保留用户可见 projection，避免 `_shuffle_order_by_N` 泄露到客户端结果。
+   - 新增 `CreatesLocalJoinQueryWithHiddenOrderByProjection` gtest，验证隐藏排序列会进入本地 `JOIN` SQL，同时 execution plan 记录最终可见列。`DistributedShuffleJoin.*` gtest 当前为 47 个且全部通过，日志见 `build/test_distributed_shuffle_join_hidden_order_by.log`。
+   - 新增真实 integration case `test_hidden_global_order_by_uses_shuffle_join`，执行 `SELECT l.left_value, r.right_value ... ORDER BY l.id DESC LIMIT 2 OFFSET 1 SETTINGS distributed_shuffle_join = 1`，验证结果按隐藏 `id` 全局排序但只返回两个 payload 列。完整 Praktika `test_distributed_shuffle_join` 当前为 `16 passed in 30.35s`，日志见 `build/test_integration_distributed_shuffle_join_hidden_order_by.log`。
+
+14. 增加了带全局排序的 `LIMIT WITH TIES` 支持。
+
+   - `DistributedShuffleJoinAnalyzer` 不再无条件拒绝 `LIMIT WITH TIES`；当前只在 query 同时具备可支持的全局 `ORDER BY` 时接受，否则仍回退普通 planner。
+   - `DistributedShuffleJoinInfo` 和 `DistributedShuffleJoinExecutionPlan` 新增 `limit_with_ties` 标记；cluster Local `JOIN` result plan 会在全局 `SortingStep` 后构造带 `with_ties = true` 和同一份 `SortDescription` 的 `LimitStep`，因此并列排序 key 的行不会被普通 `LIMIT` 截断。
+   - 新增 `ExecutionPlanCarriesLimitWithTies` gtest，验证 plan 会携带 `limit_with_ties` 和排序描述。`DistributedShuffleJoin.*` gtest 当前为 48 个且全部通过，日志见 `build/test_distributed_shuffle_join_limit_with_ties.log`。
+   - 新增真实 integration case `test_global_limit_with_ties_uses_shuffle_join`，执行 `ORDER BY modulo(l.id, 2) ASC LIMIT 1 WITH TIES`，验证排序 key 为 0 的 `id = 2, 4` 两行都会返回。完整 Praktika `test_distributed_shuffle_join` 当前为 `17 passed in 30.51s`，日志见 `build/test_integration_distributed_shuffle_join_limit_with_ties.log`。
+
+15. 增加了 `INNER ANY JOIN` strictness 支持。
+
+   - `DistributedShuffleJoinAnalyzer` 现在接受 `JoinStrictness::Any`，并把未显式 strictness 的普通 `JOIN` 继续归一为 `ALL`；`DistributedShuffleJoinInfo` 新增 `join_strictness` 字段，用于把用户查询的 strictness 传到 target shard Local `JOIN` 阶段。
+   - `createDistributedShuffleJoinLocalJoinQuery` 不再固定生成 `INNER ALL JOIN`，而是根据 execution info 生成 `INNER ALL JOIN` 或 `INNER ANY JOIN`；其他 strictness 仍会被 analyzer 或 local query helper 拒绝。
+   - 新增 `CreatesLocalJoinQueryWithAnyStrictness` gtest，验证 `JoinStrictness::Any` 会生成 `INNER ANY JOIN`。`DistributedShuffleJoin.*` gtest 当前为 49 个且全部通过，日志见 `build/test_distributed_shuffle_join_any_join.log`。
+   - 新增真实 integration case `test_inner_any_join_uses_push_based_shuffle`，使用独立的 `any_*` 表让右表存在重复 key；查询 `ANY INNER JOIN` 后只返回每个左表 key 的一行，确认 shuffle 路径没有退化为 `ALL JOIN` 的重复输出。完整 Praktika `test_distributed_shuffle_join` 当前为 `18 passed in 33.54s`，日志见 `build/test_integration_distributed_shuffle_join_any_join.log`。
+
+16. 增加了 `LEFT JOIN` 支持，并修正 `LEFT JOIN` 下的右表条件处理。
+
+   - `DistributedShuffleJoinAnalyzer` 现在接受 `JoinKind::Left`，`DistributedShuffleJoinInfo` 新增 `join_kind` 字段，用于把 `INNER` / `LEFT` 传到 target shard Local `JOIN` 阶段。
+   - `createDistributedShuffleJoinLocalJoinQuery` 不再固定生成 `INNER ... JOIN`，而是根据 execution info 生成 `INNER ALL`、`INNER ANY`、`LEFT ALL` 或 `LEFT ANY` 本地 `JOIN` SQL；当时其他 join kind 仍会被 analyzer 或 local query helper 拒绝。
+   - `LEFT JOIN` 下的 `WHERE` 条件下推规则和 `INNER JOIN` 不同：只涉及左表的条件仍可下推到 left source；只涉及右表的条件必须保留为 post-join filter，否则未匹配左表行会被错误保留或过滤。本轮已按该规则调整 analyzer。
+   - 新增 `CreatesLocalJoinQueryWithLeftKind` gtest，验证 `JoinKind::Left` 会生成 `LEFT ALL JOIN`。`DistributedShuffleJoin.*` gtest 当前为 50 个且全部通过，日志见 `build/test_distributed_shuffle_join_left_join.log`。
+   - 新增真实 integration case `test_left_all_join_uses_push_based_shuffle`，使用独立表验证未匹配左表行会以右侧默认值返回；同一用例还执行 `WHERE r.right_value = ''`，确认右表条件在 `LEFT JOIN` 下没有被错误下推。完整 Praktika `test_distributed_shuffle_join` 当前为 `19 passed in 36.53s`，日志见 `build/test_integration_distributed_shuffle_join_left_join.log`。
+
+17. 增加了 `RIGHT JOIN` 支持，并补齐 `RIGHT JOIN` 下的保留侧过滤规则。
+
+   - `DistributedShuffleJoinAnalyzer` 现在接受 `JoinKind::Right`；`JoinStrictness::RightAny` 也会被识别为可支持 strictness，并在 Local `JOIN` SQL 中格式化为 `ANY`。
+   - `createDistributedShuffleJoinLocalJoinQuery` 现在可以生成 `RIGHT ALL JOIN` 或 `RIGHT ANY JOIN`，与已有 `INNER` / `LEFT` 路径共用同一套 kind/strictness formatter。
+   - `RIGHT JOIN` 下的 `WHERE` 下推规则与 `LEFT JOIN` 对称：只涉及右表的条件可下推到 right source；只涉及左表的条件必须保留为 post-join filter，避免破坏右表保留行语义。常量条件在 `RIGHT JOIN` 下会落到 right source。
+   - 新增 `CreatesLocalJoinQueryWithRightKind` gtest，验证 `JoinKind::Right` 会生成 `RIGHT ALL JOIN`。`DistributedShuffleJoin.*` gtest 当前为 51 个且全部通过，日志见 `build/test_distributed_shuffle_join_right_join.log`。
+   - 新增真实 integration case `test_right_all_join_uses_push_based_shuffle`，使用独立表验证未匹配右表行会以左侧默认值返回；同一用例还执行 `WHERE l.left_value = ''`，确认左表条件在 `RIGHT JOIN` 下没有被错误下推。完整 Praktika `test_distributed_shuffle_join` 当前为 `20 passed in 38.01s`，日志见 `build/test_integration_distributed_shuffle_join_right_join.log`。
+
+18. 增加了 `FULL ALL JOIN` 支持，并采用最保守的 `WHERE` 处理。
+
+   - `DistributedShuffleJoinAnalyzer` 现在接受 `JoinKind::Full`，但只接受 `ALL` 或未显式 strictness；`FULL ANY JOIN` 仍不进入 MVP 路径。
+   - `createDistributedShuffleJoinLocalJoinQuery` 现在可以生成 `FULL ALL JOIN`，与已有 `INNER` / `LEFT` / `RIGHT` 路径共用同一套 kind formatter。
+   - `FULL JOIN` 同时保留左右两侧未匹配行，因此本轮不对 `WHERE` 子条件做 source 侧下推；无论条件只引用左表、只引用右表，还是常量条件，都统一保留到 target shard 的 post-join filter，避免提前过滤破坏保留行语义。
+   - 新增 `CreatesLocalJoinQueryWithFullKind` gtest，验证 `JoinKind::Full` 会生成 `FULL ALL JOIN`。`DistributedShuffleJoin.*` gtest 当前为 52 个且全部通过，日志见 `build/test_distributed_shuffle_join_full_join.log`。
+   - 新增真实 integration case `test_full_all_join_uses_push_based_shuffle`，使用独立表验证左侧未匹配行、右侧未匹配行和匹配行都能通过 shuffle 返回；同一用例还执行 `WHERE l.left_value = ''` 和 `WHERE r.right_value = ''`，确认左右两侧条件都没有被错误下推。完整 Praktika `test_distributed_shuffle_join` 当前为 `21 passed in 39.67s`，日志见 `build/test_integration_distributed_shuffle_join_full_join.log`。
+
+19. 增加了 `LEFT/RIGHT SEMI JOIN` 和 `LEFT/RIGHT ANTI JOIN` 支持。
+
+   - `DistributedShuffleJoinAnalyzer` 现在接受 `JoinStrictness::Semi` 和 `JoinStrictness::Anti`，但只允许它们出现在 `LEFT` 或 `RIGHT` join kind 上。
+   - `SEMI` / `ANTI` 的结果只输出一侧表：`LEFT SEMI` / `LEFT ANTI` 只输出左表列，`RIGHT SEMI` / `RIGHT ANTI` 只输出右表列。analyzer 会拒绝引用非输出侧的 projection、排序表达式和 `WHERE` 条件，避免 target shard Local `JOIN` 生成无法输出的列。
+   - 输出侧 deterministic `WHERE` 条件仍可下推到对应 source；非输出侧过滤需要用户显式写成 source 子查询，MVP 暂不自动改写。
+   - `createDistributedShuffleJoinLocalJoinQuery` 现在可以格式化 `SEMI` 和 `ANTI` strictness，并会拒绝 `FULL SEMI` 这类不合法 kind/strictness 组合。
+   - 新增 `CreatesLocalJoinQueryWithSemiAndAntiStrictness` gtest，验证 `LEFT SEMI JOIN`、`RIGHT ANTI JOIN` SQL 生成和非法组合拒绝。`DistributedShuffleJoin.*` gtest 当前为 53 个且全部通过，日志见 `build/test_distributed_shuffle_join_semi_anti_join.log`。
+   - 新增真实 integration case `test_semi_and_anti_join_use_push_based_shuffle`，同一组数据覆盖 `LEFT SEMI`、`LEFT ANTI`、`RIGHT SEMI` 和 `RIGHT ANTI` 四条用户 SQL，并在每条查询后确认 `_shuffle_*` 表清理完成。完整 Praktika `test_distributed_shuffle_join` 当前为 `22 passed in 43.99s`，日志见 `build/test_integration_distributed_shuffle_join_semi_anti_join.log`。
+
 当前已实现能力对应的真实 SQL 例子：
 
 假设用户最终想执行的 SQL 是：
@@ -626,7 +680,7 @@ SETTINGS distributed_shuffle_join = 1
 
    - 左边是 `StorageDistributed` 表 `a_dist`。
    - 右边是 `StorageDistributed` 表 `b_dist`。
-   - `JOIN` 是 `INNER ALL JOIN`。
+   - `JOIN` 是当前支持的 `INNER ALL` / `INNER ANY` / `LEFT ALL` / `LEFT ANY` / `RIGHT ALL` / `RIGHT ANY` / `FULL ALL` / `LEFT SEMI` / `LEFT ANTI` / `RIGHT SEMI` / `RIGHT ANTI` 简单等值 join。
    - 条件是简单等值条件，例如 `a.id = b.id`。
    - 左右表属于同一个 cluster。
 
@@ -845,6 +899,27 @@ SETTINGS distributed_shuffle_join = 1
 - `ninja -C build programs/clickhouse` 编译包含 profile events integration 覆盖所需的真实 server 二进制通过，日志见 `build/build_distributed_shuffle_join_profile_events_integration.log`。
 - `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_profile_events_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_exchange_profile_events_are_logged` 后 15 个用例全部通过，结果为 `15 passed in 30.94s`，日志见 `build/test_integration_distributed_shuffle_join_profile_events.log`。期间一次 targeted selector `test_distributed_shuffle_join::test_exchange_profile_events_are_logged` 因 Praktika integration selector 不支持 pytest `::` 形式失败，一次未传本地 image 参数导致 Docker pull infra error，最终用 `--test test_distributed_shuffle_join` 和 `CLICKHOUSE_TESTS_SKIP_DOCKER_PULL=1` / `CLICKHOUSE_TESTS_DOCKER_IMAGE_TAR=...` 通过。
 - 手动使用 `tests/integration/test_distributed_shuffle_join/_instances-gw0` 下的 compose 文件和 `--pull never` 启动本地已有镜像，执行 integration 中同样的建表、插入、`distributed_shuffle_join = 1` 查询和 cleanup 检查已通过，日志见 `build/manual_distributed_shuffle_join_query.log`、`build/manual_distributed_shuffle_join_where_query.log`、`build/manual_distributed_shuffle_join_node1_shuffle_tables.log` 和 `build/manual_distributed_shuffle_join_node2_shuffle_tables.log`。
+- `ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含隐藏 `ORDER BY` 辅助列支持的真实 server 与 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_hidden_order_by.log`。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证隐藏排序辅助列 local SQL / final projection metadata 和现有路径，47 个用例全部通过，日志见 `build/test_distributed_shuffle_join_hidden_order_by.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_hidden_order_by_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_hidden_global_order_by_uses_shuffle_join` 后 16 个用例全部通过，结果为 `16 passed in 30.35s`，日志见 `build/test_integration_distributed_shuffle_join_hidden_order_by.log`。
+- `ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含 `LIMIT WITH TIES` 支持的真实 server 与 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_limit_with_ties.log`。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证 `LIMIT WITH TIES` execution plan 传递和现有路径，48 个用例全部通过，日志见 `build/test_distributed_shuffle_join_limit_with_ties.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_limit_with_ties_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_global_limit_with_ties_uses_shuffle_join` 后 17 个用例全部通过，结果为 `17 passed in 30.51s`，日志见 `build/test_integration_distributed_shuffle_join_limit_with_ties.log`。
+- `ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含 `INNER ANY JOIN` strictness 支持的真实 server 与 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_any_join.log`。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证 `ANY` strictness local SQL 生成和现有路径，49 个用例全部通过，日志见 `build/test_distributed_shuffle_join_any_join.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_any_join_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_inner_any_join_uses_push_based_shuffle` 后 18 个用例全部通过，结果为 `18 passed in 33.54s`，日志见 `build/test_integration_distributed_shuffle_join_any_join.log`。
+- `ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含 `LEFT JOIN` 支持的真实 server 与 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_left_join.log`。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证 `LEFT` join kind local SQL 生成和现有路径，50 个用例全部通过，日志见 `build/test_distributed_shuffle_join_left_join.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_left_join_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_left_all_join_uses_push_based_shuffle` 后 19 个用例全部通过，结果为 `19 passed in 36.53s`，日志见 `build/test_integration_distributed_shuffle_join_left_join.log`。
+- `ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含 `RIGHT JOIN` 支持的真实 server 与 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_right_join.log`。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证 `RIGHT` join kind local SQL 生成和现有路径，51 个用例全部通过，日志见 `build/test_distributed_shuffle_join_right_join.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_right_join_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_right_all_join_uses_push_based_shuffle` 后 20 个用例全部通过，结果为 `20 passed in 38.01s`，日志见 `build/test_integration_distributed_shuffle_join_right_join.log`。
+- `ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含 `FULL ALL JOIN` 支持的真实 server 与 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_full_join.log`。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证 `FULL` join kind local SQL 生成和现有路径，52 个用例全部通过，日志见 `build/test_distributed_shuffle_join_full_join.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_full_join_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_full_all_join_uses_push_based_shuffle` 后 21 个用例全部通过，结果为 `21 passed in 39.67s`，日志见 `build/test_integration_distributed_shuffle_join_full_join.log`。
+- `ninja -C build programs/clickhouse src/unit_tests_dbms` 编译包含 `SEMI` / `ANTI` 支持的真实 server 与 unit test binary 通过，日志见 `build/build_distributed_shuffle_join_semi_anti_join.log`。
+- `build/src/unit_tests_dbms '--gtest_filter=DistributedShuffleJoin.*'` 验证 `SEMI` / `ANTI` strictness local SQL 生成、非法组合拒绝和现有路径，53 个用例全部通过，日志见 `build/test_distributed_shuffle_join_semi_anti_join.log`。
+- `/usr/bin/python3 -c '...'` 临时覆盖 `Settings.TEMP_DIR` 到 `tmp/praktika_shuffle_semi_anti_ci`，并通过本地 Docker image tar 运行完整 Praktika `test_distributed_shuffle_join`，新增 `test_semi_and_anti_join_use_push_based_shuffle` 后 22 个用例全部通过，结果为 `22 passed in 43.99s`，日志见 `build/test_integration_distributed_shuffle_join_semi_anti_join.log`。
 
 当前代码还没有完成的部分：
 
@@ -852,11 +927,11 @@ SETTINGS distributed_shuffle_join = 1
 - 已有 `ClusterDistributedShuffleJoinBlockSender`、当前 shard Exchange executor、远端 `SYSTEM` payload 执行入口、system-query Exchange executor、完整阶段编排 helper、可延后 cleanup 的 `Prepare -> Exchange` helper，以及 pipeline resource holder；当前 shard 进程内已经能把 source side executor 接到 coordinator Exchange executor 接口，收到远端 `SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE ...` 的 shard 也能解析 payload 并执行本地 left/right source Exchange。`executeDistributedShuffleJoinPipeline` 已经把这些组件串成真实 `SELECT` hook 使用的完整入口，内部 `SYSTEM` 入口也已限制为 internal query 或带 `distributed_depth` 的 `SECONDARY_QUERY`。
 - coordinator 目前完成 `Prepare`、`Exchange` 调度入口、`Barrier -> Local JOIN` result pipeline 和 `Cleanup`，并已有基于 `ConnectionPoolWithFailover` 的真实 query executor。
 - 已在 `InterpreterSelectQueryAnalyzer::execute` 接入真实 distributed query path 的 MVP hook，并已手动跑通真实两节点 server demo；完整 Praktika integration job 也已通过。
-- 当前覆盖简单直接列 projection、deterministic expression projection、可下推到单表 source 的 deterministic `WHERE` 子条件、可在 target shard Local `JOIN` 后执行的 deterministic post-join filter、按已输出 deterministic 表达式进行的全局 `ORDER BY`，以及普通常量 `LIMIT` / `OFFSET`；聚合、隐藏排序键、特殊排序语义和 `LIMIT WITH TIES` 等仍由 analyzer 保守拒绝。
+- 当前覆盖 `INNER ALL JOIN` / `INNER ANY JOIN` / `LEFT ALL JOIN` / `LEFT ANY JOIN` / `RIGHT ALL JOIN` / `RIGHT ANY JOIN` / `FULL ALL JOIN` / `LEFT SEMI JOIN` / `LEFT ANTI JOIN` / `RIGHT SEMI JOIN` / `RIGHT ANTI JOIN`、简单直接列 projection、deterministic expression projection、可下推到单表 source 的 deterministic `WHERE` 子条件、可在 target shard Local `JOIN` 后执行的 deterministic post-join filter、按已输出或隐藏 deterministic 表达式进行的全局 `ORDER BY`，以及普通常量 `LIMIT` / `OFFSET` 和带全局排序的 `LIMIT WITH TIES`；`FULL ANY JOIN`、聚合、其他特殊 join 语义和特殊排序语义等仍由 analyzer 保守拒绝。
 
 下一步建议：
 
-1. 后续逐步放开 query 形态：优先考虑聚合、隐藏排序键所需的辅助列输出，以及 `LIMIT WITH TIES`。
+1. 后续逐步放开 query 形态：优先考虑聚合以及更多排序语义。
 2. 在 opportunistic cleanup 基础上继续实现常驻后台超时扫描，使恢复后没有新 shuffle 流量的空闲 shard 也能回收遗留 `_shuffle_*` 表。
 
 ### 未来产品化方向

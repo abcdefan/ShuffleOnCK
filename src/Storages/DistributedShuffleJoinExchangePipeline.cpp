@@ -12,6 +12,7 @@
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
 #include <Interpreters/ClusterProxy/executeQuery.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterDropQuery.h>
 #include <Interpreters/InterpreterSelectQuery.h>
@@ -23,6 +24,7 @@
 #include <Parsers/parseQuery.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/LimitStep.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
@@ -49,6 +51,7 @@
 #include <chrono>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -176,6 +179,114 @@ String formatLocalJoinProjectionList(const DistributedShuffleJoinInfo & info)
     }
 
     return result;
+}
+
+Names getVisibleResultColumns(const DistributedShuffleJoinInfo & info)
+{
+    Names result;
+    for (const auto & column : info.projection_columns)
+    {
+        if (!column.is_hidden)
+            result.push_back(column.result_column_name);
+    }
+
+    return result;
+}
+
+bool hasHiddenProjectionColumns(const DistributedShuffleJoinInfo & info)
+{
+    for (const auto & column : info.projection_columns)
+        if (column.is_hidden)
+            return true;
+
+    return false;
+}
+
+bool isSemiOrAntiJoin(JoinStrictness strictness)
+{
+    return strictness == JoinStrictness::Semi || strictness == JoinStrictness::Anti;
+}
+
+bool isSupportedLocalJoinCombination(JoinKind kind, JoinStrictness strictness)
+{
+    if (kind == JoinKind::Full)
+        return strictness == JoinStrictness::All || strictness == JoinStrictness::Unspecified;
+
+    if (isSemiOrAntiJoin(strictness))
+        return kind == JoinKind::Left || kind == JoinKind::Right;
+
+    return strictness == JoinStrictness::All
+        || strictness == JoinStrictness::Any
+        || strictness == JoinStrictness::RightAny
+        || strictness == JoinStrictness::Unspecified;
+}
+
+String formatJoinStrictness(JoinStrictness strictness)
+{
+    if (strictness == JoinStrictness::All || strictness == JoinStrictness::Unspecified)
+        return "ALL";
+
+    if (strictness == JoinStrictness::Any || strictness == JoinStrictness::RightAny)
+        return "ANY";
+
+    if (strictness == JoinStrictness::Semi)
+        return "SEMI";
+
+    if (strictness == JoinStrictness::Anti)
+        return "ANTI";
+
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Distributed `shuffle join` local `JOIN` strictness {} is not supported",
+        toString(strictness));
+}
+
+String formatJoinKind(JoinKind kind)
+{
+    if (kind == JoinKind::Inner)
+        return "INNER";
+
+    if (kind == JoinKind::Left)
+        return "LEFT";
+
+    if (kind == JoinKind::Right)
+        return "RIGHT";
+
+    if (kind == JoinKind::Full)
+        return "FULL";
+
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Distributed `shuffle join` local `JOIN` kind {} is not supported",
+        toString(kind));
+}
+
+ActionsDAG createFinalProjectionActions(const Block & header, const Names & visible_result_columns)
+{
+    ActionsDAG actions;
+    std::unordered_map<String, const ActionsDAG::Node *> inputs_by_name;
+
+    for (const auto & column : header.getColumnsWithTypeAndName())
+    {
+        const auto * input = &actions.addInput(column);
+        inputs_by_name.emplace(column.name, input);
+    }
+
+    for (const auto & column_name : visible_result_columns)
+    {
+        auto it = inputs_by_name.find(column_name);
+        if (it == inputs_by_name.end())
+        {
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Distributed `shuffle join` final projection column {} is missing from local `JOIN` header",
+                column_name);
+        }
+
+        actions.getOutputs().push_back(it->second);
+    }
+
+    return actions;
 }
 
 void validateExchangeInfo(const DistributedShuffleJoinInfo & info, DistributedShuffleJoinTableSide side)
@@ -666,10 +777,21 @@ String createDistributedShuffleJoinLocalJoinQuery(
     validateExchangeInfo(info, DistributedShuffleJoinTableSide::Left);
     validateExchangeInfo(info, DistributedShuffleJoinTableSide::Right);
 
+    if (!isSupportedLocalJoinCombination(info.join_kind, info.join_strictness))
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Distributed `shuffle join` local `JOIN` combination {} {} is not supported",
+            toString(info.join_kind),
+            toString(info.join_strictness));
+    }
+
     auto query = fmt::format(
-        "SELECT {} FROM {} AS _shuffle_left INNER ALL JOIN {} AS _shuffle_right ON _shuffle_left.{} = _shuffle_right.{}",
+        "SELECT {} FROM {} AS _shuffle_left {} {} JOIN {} AS _shuffle_right ON _shuffle_left.{} = _shuffle_right.{}",
         formatLocalJoinProjectionList(info),
         table_names.getQualifiedTableName(DistributedShuffleJoinTableSide::Left),
+        formatJoinKind(info.join_kind),
+        formatJoinStrictness(info.join_strictness),
         table_names.getQualifiedTableName(DistributedShuffleJoinTableSide::Right),
         backQuoteIfNeed(info.left_key_column_name),
         backQuoteIfNeed(info.right_key_column_name));
@@ -815,8 +937,11 @@ DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
     plan.right_header = createDistributedShuffleJoinExchangeHeader(info, DistributedShuffleJoinTableSide::Right);
     plan.local_join_query = createDistributedShuffleJoinLocalJoinQuery(plan.table_names, info);
     plan.order_by = info.order_by;
+    plan.visible_result_columns = getVisibleResultColumns(info);
+    plan.has_hidden_projection_columns = hasHiddenProjectionColumns(info);
     plan.limit_length = info.limit_length;
     plan.limit_offset = info.limit_offset;
+    plan.limit_with_ties = info.limit_with_ties;
     return plan;
 }
 
@@ -1217,10 +1342,26 @@ void buildDistributedShuffleJoinClusterLocalJoinQueryPlan(
 
     if (plan.limit_length)
     {
-        query_plan.addStep(std::make_unique<LimitStep>(
+        auto limit_step = std::make_unique<LimitStep>(
             query_plan.getCurrentHeader(),
             *plan.limit_length,
-            plan.limit_offset));
+            plan.limit_offset,
+            /* always_read_till_end= */ false,
+            plan.limit_with_ties,
+            plan.limit_with_ties ? plan.order_by : SortDescription{});
+        if (plan.limit_with_ties)
+            limit_step->setStepDescription("LIMIT WITH TIES for distributed shuffle join");
+
+        query_plan.addStep(std::move(limit_step));
+    }
+
+    if (plan.has_hidden_projection_columns)
+    {
+        auto final_projection_step = std::make_unique<ExpressionStep>(
+            query_plan.getCurrentHeader(),
+            createFinalProjectionActions(*query_plan.getCurrentHeader(), plan.visible_result_columns));
+        final_projection_step->setStepDescription("Remove hidden distributed shuffle join columns");
+        query_plan.addStep(std::move(final_projection_step));
     }
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Analyzer/IQueryTreeNode.h>
+#include <Core/Joins.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/SortDescription.h>
 #include <Interpreters/Context_fwd.h>
@@ -18,6 +19,7 @@ class StorageDistributed;
 struct DistributedShuffleJoinProjectionColumn
 {
     bool is_left = false;
+    bool is_hidden = false;
     String source_column_name;
     String expression;
     String result_column_name;
@@ -35,6 +37,8 @@ struct DistributedShuffleJoinInfo
     QueryTreeNodePtr right_key_expression;
     String left_key_column_name;
     String right_key_column_name;
+    JoinKind join_kind = JoinKind::Inner;
+    JoinStrictness join_strictness = JoinStrictness::All;
 
     NamesAndTypes left_required_columns;
     NamesAndTypes right_required_columns;
@@ -45,6 +49,7 @@ struct DistributedShuffleJoinInfo
     SortDescription order_by;
     std::optional<UInt64> limit_length;
     UInt64 limit_offset = 0;
+    bool limit_with_ties = false;
 
     String cluster_name;
     String shuffle_database;

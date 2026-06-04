@@ -70,8 +70,7 @@ bool hasUnsupportedSelectClauses(const QueryNode & query_node)
         || query_node.hasLimitByLimit()
         || query_node.hasLimitByOffset()
         || query_node.hasLimitBy()
-        || query_node.isLimitByAll()
-        || query_node.isLimitWithTies();
+        || query_node.isLimitByAll();
 }
 
 class CollectColumnSourceToColumnsVisitor : public InDepthQueryTreeVisitor<CollectColumnSourceToColumnsVisitor>
@@ -121,11 +120,28 @@ private:
     std::unordered_map<QueryTreeNodePtr, Columns> column_source_to_columns;
 };
 
-bool isSupportedJoinStrictness(JoinStrictness strictness)
+bool isSupportedJoinStrictness(JoinKind kind, JoinStrictness strictness)
 {
     /// `Unspecified` can appear before defaults are fully normalized and means
     /// the regular `ALL` strictness for plain `JOIN`.
-    return strictness == JoinStrictness::All || strictness == JoinStrictness::Unspecified;
+    if (kind == JoinKind::Full)
+        return strictness == JoinStrictness::All || strictness == JoinStrictness::Unspecified;
+
+    if (strictness == JoinStrictness::Semi || strictness == JoinStrictness::Anti)
+        return kind == JoinKind::Left || kind == JoinKind::Right;
+
+    return strictness == JoinStrictness::All
+        || strictness == JoinStrictness::Any
+        || strictness == JoinStrictness::RightAny
+        || strictness == JoinStrictness::Unspecified;
+}
+
+bool isSupportedJoinKind(JoinKind kind)
+{
+    return kind == JoinKind::Inner
+        || kind == JoinKind::Left
+        || kind == JoinKind::Right
+        || kind == JoinKind::Full;
 }
 
 bool collectUsingJoinKeys(DistributedShuffleJoinInfo & info, const JoinNode & join_node)
@@ -191,6 +207,34 @@ bool collectOnJoinKeys(DistributedShuffleJoinInfo & info, const JoinNode & join_
     return true;
 }
 
+bool isSemiOrAntiJoin(JoinStrictness strictness)
+{
+    return strictness == JoinStrictness::Semi || strictness == JoinStrictness::Anti;
+}
+
+bool isExpressionFromSemiAntiOutputSide(
+    const QueryTreeNodePtr & node,
+    const DistributedShuffleJoinInfo & info)
+{
+    if (!isSemiOrAntiJoin(info.join_strictness))
+        return true;
+
+    auto [source, valid] = getExpressionSource(node);
+    if (!valid)
+        return false;
+
+    if (!source)
+        return true;
+
+    if (info.join_kind == JoinKind::Left)
+        return source->isEqual(*info.left_table_expression);
+
+    if (info.join_kind == JoinKind::Right)
+        return source->isEqual(*info.right_table_expression);
+
+    return false;
+}
+
 void collectRequiredColumns(DistributedShuffleJoinInfo & info, QueryTreeNodePtr query_tree)
 {
     CollectColumnSourceToColumnsVisitor visitor;
@@ -226,6 +270,9 @@ bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode
 
     for (size_t i = 0; i < projection_nodes.size(); ++i)
     {
+        if (!isExpressionFromSemiAntiOutputSide(projection_nodes[i], info))
+            return false;
+
         if (const auto * column_node = projection_nodes[i]->as<ColumnNode>())
         {
             auto column_source = column_node->getColumnSourceOrNull();
@@ -237,7 +284,12 @@ bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode
             if (!is_left && !is_right)
                 return false;
 
-            info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{is_left, column_node->getColumnName(), {}, projection_columns[i].name});
+            info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{
+                .is_left = is_left,
+                .is_hidden = false,
+                .source_column_name = column_node->getColumnName(),
+                .expression = {},
+                .result_column_name = projection_columns[i].name});
             continue;
         }
 
@@ -248,7 +300,12 @@ bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode
         if (!expression)
             return false;
 
-        info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{false, {}, std::move(*expression), projection_columns[i].name});
+        info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = false,
+            .source_column_name = {},
+            .expression = std::move(*expression),
+            .result_column_name = projection_columns[i].name});
     }
 
     return true;
@@ -457,7 +514,30 @@ bool collectWhereFilters(DistributedShuffleJoinInfo & info, const QueryNode & qu
         if (!collectFilterSourceMask(conjunct, info, source_mask))
             return false;
 
-        if (source_mask.isPostJoin())
+        if (isSemiOrAntiJoin(info.join_strictness))
+        {
+            auto filter_condition = formatFilterCondition(conjunct);
+            if (source_mask.isConstant())
+            {
+                if (info.join_kind == JoinKind::Right)
+                    right_conditions.push_back(std::move(filter_condition));
+                else
+                    left_conditions.push_back(std::move(filter_condition));
+            }
+            else if (info.join_kind == JoinKind::Left && source_mask.isLeftOnly())
+                left_conditions.push_back(std::move(filter_condition));
+            else if (info.join_kind == JoinKind::Right && source_mask.isRightOnly())
+                right_conditions.push_back(std::move(filter_condition));
+            else
+                return false;
+
+            continue;
+        }
+
+        if (info.join_kind == JoinKind::Full
+            || source_mask.isPostJoin()
+            || (info.join_kind == JoinKind::Left && source_mask.isRightOnly())
+            || (info.join_kind == JoinKind::Right && source_mask.isLeftOnly()))
         {
             auto filter_condition = formatPostJoinExpression(conjunct, info);
             if (!filter_condition)
@@ -468,7 +548,14 @@ bool collectWhereFilters(DistributedShuffleJoinInfo & info, const QueryNode & qu
         }
 
         auto filter_condition = formatFilterCondition(conjunct);
-        if (source_mask.isConstant() || source_mask.isLeftOnly())
+        if (source_mask.isConstant())
+        {
+            if (info.join_kind == JoinKind::Right)
+                right_conditions.push_back(std::move(filter_condition));
+            else
+                left_conditions.push_back(std::move(filter_condition));
+        }
+        else if (source_mask.isLeftOnly())
             left_conditions.push_back(std::move(filter_condition));
         else if (source_mask.isRightOnly())
             right_conditions.push_back(std::move(filter_condition));
@@ -486,6 +573,14 @@ bool collectLimit(DistributedShuffleJoinInfo & info, const QueryNode & query_nod
 {
     if (!query_node.hasLimit())
         return !query_node.hasOffset();
+
+    if (query_node.isLimitWithTies())
+    {
+        if (info.order_by.empty())
+            return false;
+
+        info.limit_with_ties = true;
+    }
 
     const auto * limit_node = query_node.getLimit()->as<ConstantNode>();
     if (!limit_node || limit_node->getValue().getType() != Field::Types::UInt64)
@@ -513,6 +608,26 @@ bool collectOrderBy(DistributedShuffleJoinInfo & info, const QueryNode & query_n
     if (projection_nodes.size() != projection_columns.size())
         return false;
 
+    auto make_hidden_order_by_column_name = [&]() -> String
+    {
+        for (size_t index = 0;; ++index)
+        {
+            String name = "_shuffle_order_by_" + std::to_string(index);
+            bool exists = false;
+            for (const auto & projection_column : info.projection_columns)
+            {
+                if (projection_column.result_column_name == name)
+                {
+                    exists = true;
+                    break;
+                }
+            }
+
+            if (!exists)
+                return name;
+        }
+    };
+
     for (const auto & order_by_node : query_node.getOrderBy().getNodes())
     {
         const auto * sort_node = order_by_node->as<SortNode>();
@@ -529,8 +644,31 @@ bool collectOrderBy(DistributedShuffleJoinInfo & info, const QueryNode & query_n
             }
         }
 
-        if (projection_index == projection_nodes.size())
-            return false;
+        String order_by_column_name;
+        if (projection_index != projection_nodes.size())
+        {
+            order_by_column_name = projection_columns[projection_index].name;
+        }
+        else
+        {
+            if (!isExpressionFromSemiAntiOutputSide(sort_node->getExpression(), info))
+                return false;
+
+            if (!isDeterministicFilterExpression(sort_node->getExpression()))
+                return false;
+
+            auto expression = formatPostJoinExpression(sort_node->getExpression(), info);
+            if (!expression)
+                return false;
+
+            order_by_column_name = make_hidden_order_by_column_name();
+            info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{
+                .is_left = false,
+                .is_hidden = true,
+                .source_column_name = {},
+                .expression = std::move(*expression),
+                .result_column_name = order_by_column_name});
+        }
 
         const int direction = sort_node->getSortDirection() == SortDirection::ASCENDING ? 1 : -1;
         const auto nulls_sort_direction = sort_node->getNullsSortDirection();
@@ -538,7 +676,7 @@ bool collectOrderBy(DistributedShuffleJoinInfo & info, const QueryNode & query_n
             ? (*nulls_sort_direction == SortDirection::ASCENDING ? 1 : -1)
             : direction;
 
-        info.order_by.emplace_back(projection_columns[projection_index].name, direction, nulls_direction);
+        info.order_by.emplace_back(std::move(order_by_column_name), direction, nulls_direction);
     }
 
     return true;
@@ -607,8 +745,8 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
     if (!join_node)
         return {};
 
-    if (join_node->getKind() != JoinKind::Inner
-        || !isSupportedJoinStrictness(join_node->getStrictness())
+    if (!isSupportedJoinKind(join_node->getKind())
+        || !isSupportedJoinStrictness(join_node->getKind(), join_node->getStrictness())
         || join_node->getLocality() == JoinLocality::Global
         || !join_node->hasJoinExpression())
     {
@@ -638,6 +776,8 @@ std::optional<DistributedShuffleJoinInfo> tryAnalyzeDistributedShuffleJoin(
     info.right_table_expression = join_node->getRightTableExpression();
     info.left_storage = left_storage;
     info.right_storage = right_storage;
+    info.join_kind = join_node->getKind();
+    info.join_strictness = join_node->getStrictness() == JoinStrictness::Unspecified ? JoinStrictness::All : join_node->getStrictness();
     info.cluster_name = left_cluster->getName();
     info.shuffle_database = left_storage->getStorageID().database_name;
     info.shard_count = left_cluster->getShardCount();

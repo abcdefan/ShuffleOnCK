@@ -634,6 +634,109 @@ TEST(DistributedShuffleJoin, CreatesLocalJoinQuery)
         "ON _shuffle_left.`left key` = _shuffle_right.`right key`");
 }
 
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithAnyStrictness)
+{
+    auto info = makeExchangeInfo();
+    info.join_strictness = JoinStrictness::Any;
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-any-join-query-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(table_names, info),
+        "SELECT * FROM default._shuffle_local_any_join_query_test_0_left AS _shuffle_left "
+        "INNER ANY JOIN default._shuffle_local_any_join_query_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithLeftKind)
+{
+    auto info = makeExchangeInfo();
+    info.join_kind = JoinKind::Left;
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-left-join-query-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(table_names, info),
+        "SELECT * FROM default._shuffle_local_left_join_query_test_0_left AS _shuffle_left "
+        "LEFT ALL JOIN default._shuffle_local_left_join_query_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithRightKind)
+{
+    auto info = makeExchangeInfo();
+    info.join_kind = JoinKind::Right;
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-right-join-query-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(table_names, info),
+        "SELECT * FROM default._shuffle_local_right_join_query_test_0_left AS _shuffle_left "
+        "RIGHT ALL JOIN default._shuffle_local_right_join_query_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithFullKind)
+{
+    auto info = makeExchangeInfo();
+    info.join_kind = JoinKind::Full;
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-full-join-query-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(table_names, info),
+        "SELECT * FROM default._shuffle_local_full_join_query_test_0_left AS _shuffle_left "
+        "FULL ALL JOIN default._shuffle_local_full_join_query_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithSemiAndAntiStrictness)
+{
+    auto left_semi_info = makeExchangeInfo();
+    left_semi_info.join_kind = JoinKind::Left;
+    left_semi_info.join_strictness = JoinStrictness::Semi;
+
+    const auto left_semi_table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-left-semi-join-query-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(left_semi_table_names, left_semi_info),
+        "SELECT * FROM default._shuffle_local_left_semi_join_query_test_0_left AS _shuffle_left "
+        "LEFT SEMI JOIN default._shuffle_local_left_semi_join_query_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+
+    auto right_anti_info = makeExchangeInfo();
+    right_anti_info.join_kind = JoinKind::Right;
+    right_anti_info.join_strictness = JoinStrictness::Anti;
+
+    const auto right_anti_table_names = createDistributedShuffleJoinTableNames(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "local-right-anti-join-query-test", .join_id = 0});
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinLocalJoinQuery(right_anti_table_names, right_anti_info),
+        "SELECT * FROM default._shuffle_local_right_anti_join_query_test_0_left AS _shuffle_left "
+        "RIGHT ANTI JOIN default._shuffle_local_right_anti_join_query_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+
+    auto invalid_info = makeExchangeInfo();
+    invalid_info.join_kind = JoinKind::Full;
+    invalid_info.join_strictness = JoinStrictness::Semi;
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLocalJoinQuery(right_anti_table_names, invalid_info),
+        Exception);
+}
+
 TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithProjection)
 {
     auto info = makeExchangeInfo();
@@ -646,9 +749,24 @@ TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithProjection)
         {"right value", std::make_shared<DataTypeUInt64>()},
     };
     info.projection_columns = {
-        DistributedShuffleJoinProjectionColumn{true, "id", "", "id"},
-        DistributedShuffleJoinProjectionColumn{true, "left value", "", "value"},
-        DistributedShuffleJoinProjectionColumn{false, "right value", "", "right value"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = true,
+            .is_hidden = false,
+            .source_column_name = "id",
+            .expression = "",
+            .result_column_name = "id"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = true,
+            .is_hidden = false,
+            .source_column_name = "left value",
+            .expression = "",
+            .result_column_name = "value"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = false,
+            .source_column_name = "right value",
+            .expression = "",
+            .result_column_name = "right value"},
     };
 
     const auto table_names = createDistributedShuffleJoinTableNames(
@@ -667,8 +785,18 @@ TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithExpressionProjection)
 {
     auto info = makeExchangeInfo();
     info.projection_columns = {
-        DistributedShuffleJoinProjectionColumn{false, "", "_shuffle_left.id", "id"},
-        DistributedShuffleJoinProjectionColumn{false, "", "plus(_shuffle_left.id, _shuffle_right.id)", "sum id"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = false,
+            .source_column_name = "",
+            .expression = "_shuffle_left.id",
+            .result_column_name = "id"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = false,
+            .source_column_name = "",
+            .expression = "plus(_shuffle_left.id, _shuffle_right.id)",
+            .result_column_name = "sum id"},
     };
 
     const auto table_names = createDistributedShuffleJoinTableNames(
@@ -681,6 +809,41 @@ TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithExpressionProjection)
         "FROM default._shuffle_local_join_expression_projection_test_0_left AS _shuffle_left "
         "INNER ALL JOIN default._shuffle_local_join_expression_projection_test_0_right AS _shuffle_right "
         "ON _shuffle_left.id = _shuffle_right.id");
+}
+
+TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithHiddenOrderByProjection)
+{
+    auto info = makeExchangeInfo();
+    info.projection_columns = {
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = true,
+            .is_hidden = false,
+            .source_column_name = "left value",
+            .expression = "",
+            .result_column_name = "value"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = true,
+            .source_column_name = "",
+            .expression = "_shuffle_left.id",
+            .result_column_name = "_shuffle_order_by_0"},
+    };
+    info.order_by.emplace_back("_shuffle_order_by_0", -1, -1);
+
+    const auto plan = createDistributedShuffleJoinExecutionPlan(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "hidden-order-by-projection-test", .join_id = 0},
+        info);
+
+    EXPECT_EQ(
+        plan.local_join_query,
+        "SELECT _shuffle_left.`left value` AS value, _shuffle_left.id AS _shuffle_order_by_0 "
+        "FROM default._shuffle_hidden_order_by_projection_test_0_left AS _shuffle_left "
+        "INNER ALL JOIN default._shuffle_hidden_order_by_projection_test_0_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id");
+    ASSERT_EQ(plan.visible_result_columns.size(), 1);
+    EXPECT_EQ(plan.visible_result_columns[0], "value");
+    EXPECT_TRUE(plan.has_hidden_projection_columns);
 }
 
 TEST(DistributedShuffleJoin, CreatesLocalJoinQueryWithPostJoinFilter)
@@ -759,6 +922,26 @@ TEST(DistributedShuffleJoin, ExecutionPlanCarriesGlobalLimit)
     ASSERT_TRUE(plan.limit_length.has_value());
     EXPECT_EQ(*plan.limit_length, 2);
     EXPECT_EQ(plan.limit_offset, 1);
+    EXPECT_FALSE(plan.limit_with_ties);
+}
+
+TEST(DistributedShuffleJoin, ExecutionPlanCarriesLimitWithTies)
+{
+    auto info = makeExchangeInfo();
+    info.order_by.emplace_back("_shuffle_order_by_0", 1, 1);
+    info.limit_length = 1;
+    info.limit_with_ties = true;
+
+    const auto plan = createDistributedShuffleJoinExecutionPlan(
+        "default",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "limit-with-ties-plan-test", .join_id = 0},
+        info);
+
+    ASSERT_TRUE(plan.limit_length.has_value());
+    EXPECT_EQ(*plan.limit_length, 1);
+    EXPECT_TRUE(plan.limit_with_ties);
+    ASSERT_EQ(plan.order_by.size(), 1);
+    EXPECT_EQ(plan.order_by[0].column_name, "_shuffle_order_by_0");
 }
 
 TEST(DistributedShuffleJoin, ExecutionPlanCarriesGlobalOrderBy)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Core/Block.h>
+#include <Core/Names.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/DistributedShuffleJoinCoordinator.h>
 #include <QueryPipeline/BlockIO.h>
@@ -47,8 +48,11 @@ struct DistributedShuffleJoinExecutionPlan
     Block right_header;
     String local_join_query;
     SortDescription order_by;
+    Names visible_result_columns;
+    bool has_hidden_projection_columns = false;
     std::optional<UInt64> limit_length;
     UInt64 limit_offset = 0;
+    bool limit_with_ties = false;
 };
 
 class IDistributedShuffleJoinExchangeSideExecutor

@@ -111,6 +111,375 @@ def test_inner_all_join_using_key_uses_push_based_shuffle(started_cluster):
     assert_no_shuffle_tables()
 
 
+def test_inner_any_join_uses_push_based_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS any_left_dist")
+        node.query("DROP TABLE IF EXISTS any_right_dist")
+        node.query("DROP TABLE IF EXISTS any_left_local")
+        node.query("DROP TABLE IF EXISTS any_right_local")
+
+        node.query(
+            "CREATE TABLE any_left_local (id UInt64, left_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE any_right_local (id UInt64, right_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE any_left_dist AS any_left_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, any_left_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE any_right_dist AS any_right_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, any_right_local, rand())"
+        )
+
+    try:
+        node1.query("INSERT INTO any_left_local VALUES (1, 'l1_node1'), (2, 'l2_node1')")
+        node2.query("INSERT INTO any_left_local VALUES (3, 'l3_node2')")
+
+        node1.query(
+            "INSERT INTO any_right_local VALUES "
+            "(1, 'r1a_node1'), (1, 'r1b_node1'), (3, 'r3_node1')"
+        )
+        node2.query(
+            "INSERT INTO any_right_local VALUES "
+            "(2, 'r2a_node2'), (2, 'r2b_node2')"
+        )
+
+        query = """
+            SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
+            FROM any_left_dist AS l
+            ANY INNER JOIN any_right_dist AS r ON l.id = r.id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+                any_join_distinct_right_table_keys = 0
+        """
+
+        rows = node1.query(query).strip().splitlines()
+
+        assert len(rows) == 3
+        assert rows[0].startswith("1\tl1_node1\tr1")
+        assert rows[1].startswith("2\tl2_node1\tr2")
+        assert rows[2] == "3\tl3_node2\tr3_node1"
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS any_left_dist")
+            node.query("DROP TABLE IF EXISTS any_right_dist")
+            node.query("DROP TABLE IF EXISTS any_left_local")
+            node.query("DROP TABLE IF EXISTS any_right_local")
+
+
+def test_left_all_join_uses_push_based_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS left_join_left_dist")
+        node.query("DROP TABLE IF EXISTS left_join_right_dist")
+        node.query("DROP TABLE IF EXISTS left_join_left_local")
+        node.query("DROP TABLE IF EXISTS left_join_right_local")
+
+        node.query(
+            "CREATE TABLE left_join_left_local (id UInt64, left_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_join_right_local (id UInt64, right_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_join_left_dist AS left_join_left_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_join_left_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_join_right_dist AS left_join_right_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_join_right_local, rand())"
+        )
+
+    try:
+        node1.query(
+            "INSERT INTO left_join_left_local VALUES "
+            "(1, 'l1_node1'), (2, 'l2_node1')"
+        )
+        node2.query("INSERT INTO left_join_left_local VALUES (3, 'l3_node2')")
+
+        node1.query("INSERT INTO left_join_right_local VALUES (2, 'r2_node1')")
+        node2.query("INSERT INTO left_join_right_local VALUES (1, 'r1_node2')")
+
+        query = """
+            SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
+            FROM left_join_left_dist AS l
+            LEFT ALL JOIN left_join_right_dist AS r ON l.id = r.id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(query).splitlines() == [
+            "1\tl1_node1\tr1_node2",
+            "2\tl2_node1\tr2_node1",
+            "3\tl3_node2\t",
+        ]
+        assert_no_shuffle_tables()
+
+        right_filter_query = """
+            SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
+            FROM left_join_left_dist AS l
+            LEFT ALL JOIN left_join_right_dist AS r ON l.id = r.id
+            WHERE r.right_value = ''
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(right_filter_query).splitlines() == [
+            "3\tl3_node2\t",
+        ]
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS left_join_left_dist")
+            node.query("DROP TABLE IF EXISTS left_join_right_dist")
+            node.query("DROP TABLE IF EXISTS left_join_left_local")
+            node.query("DROP TABLE IF EXISTS left_join_right_local")
+
+
+def test_right_all_join_uses_push_based_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS right_join_left_dist")
+        node.query("DROP TABLE IF EXISTS right_join_right_dist")
+        node.query("DROP TABLE IF EXISTS right_join_left_local")
+        node.query("DROP TABLE IF EXISTS right_join_right_local")
+
+        node.query(
+            "CREATE TABLE right_join_left_local (id UInt64, left_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE right_join_right_local (id UInt64, right_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE right_join_left_dist AS right_join_left_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, right_join_left_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE right_join_right_dist AS right_join_right_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, right_join_right_local, rand())"
+        )
+
+    try:
+        node1.query("INSERT INTO right_join_left_local VALUES (1, 'l1_node1')")
+        node2.query("INSERT INTO right_join_left_local VALUES (2, 'l2_node2')")
+
+        node1.query(
+            "INSERT INTO right_join_right_local VALUES "
+            "(2, 'r2_node1'), (3, 'r3_node1')"
+        )
+        node2.query("INSERT INTO right_join_right_local VALUES (1, 'r1_node2')")
+
+        query = """
+            SELECT r.id AS id, l.left_value AS left_value, r.right_value AS right_value
+            FROM right_join_left_dist AS l
+            RIGHT ALL JOIN right_join_right_dist AS r ON l.id = r.id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(query).splitlines() == [
+            "1\tl1_node1\tr1_node2",
+            "2\tl2_node2\tr2_node1",
+            "3\t\tr3_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        left_filter_query = """
+            SELECT r.id AS id, l.left_value AS left_value, r.right_value AS right_value
+            FROM right_join_left_dist AS l
+            RIGHT ALL JOIN right_join_right_dist AS r ON l.id = r.id
+            WHERE l.left_value = ''
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(left_filter_query).splitlines() == [
+            "3\t\tr3_node1",
+        ]
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS right_join_left_dist")
+            node.query("DROP TABLE IF EXISTS right_join_right_dist")
+            node.query("DROP TABLE IF EXISTS right_join_left_local")
+            node.query("DROP TABLE IF EXISTS right_join_right_local")
+
+
+def test_semi_and_anti_join_use_push_based_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS semi_anti_left_dist")
+        node.query("DROP TABLE IF EXISTS semi_anti_right_dist")
+        node.query("DROP TABLE IF EXISTS semi_anti_left_local")
+        node.query("DROP TABLE IF EXISTS semi_anti_right_local")
+
+        node.query(
+            "CREATE TABLE semi_anti_left_local (id UInt64, left_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE semi_anti_right_local (id UInt64, right_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE semi_anti_left_dist AS semi_anti_left_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, semi_anti_left_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE semi_anti_right_dist AS semi_anti_right_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, semi_anti_right_local, rand())"
+        )
+
+    try:
+        node1.query(
+            "INSERT INTO semi_anti_left_local VALUES "
+            "(1, 'l1_node1'), (2, 'l2_node1')"
+        )
+        node2.query("INSERT INTO semi_anti_left_local VALUES (3, 'l3_node2')")
+
+        node1.query("INSERT INTO semi_anti_right_local VALUES (2, 'r2_node1')")
+        node2.query("INSERT INTO semi_anti_right_local VALUES (4, 'r4_node2')")
+
+        left_semi_query = """
+            SELECT l.id AS id, l.left_value AS left_value
+            FROM semi_anti_left_dist AS l
+            LEFT SEMI JOIN semi_anti_right_dist AS r ON l.id = r.id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(left_semi_query).splitlines() == [
+            "2\tl2_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        left_anti_query = """
+            SELECT l.id AS id, l.left_value AS left_value
+            FROM semi_anti_left_dist AS l
+            LEFT ANTI JOIN semi_anti_right_dist AS r ON l.id = r.id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(left_anti_query).splitlines() == [
+            "1\tl1_node1",
+            "3\tl3_node2",
+        ]
+        assert_no_shuffle_tables()
+
+        right_semi_query = """
+            SELECT r.id AS id, r.right_value AS right_value
+            FROM semi_anti_left_dist AS l
+            RIGHT SEMI JOIN semi_anti_right_dist AS r ON l.id = r.id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(right_semi_query).splitlines() == [
+            "2\tr2_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        right_anti_query = """
+            SELECT r.id AS id, r.right_value AS right_value
+            FROM semi_anti_left_dist AS l
+            RIGHT ANTI JOIN semi_anti_right_dist AS r ON l.id = r.id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(right_anti_query).splitlines() == [
+            "4\tr4_node2",
+        ]
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS semi_anti_left_dist")
+            node.query("DROP TABLE IF EXISTS semi_anti_right_dist")
+            node.query("DROP TABLE IF EXISTS semi_anti_left_local")
+            node.query("DROP TABLE IF EXISTS semi_anti_right_local")
+
+
+def test_full_all_join_uses_push_based_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS full_join_left_dist")
+        node.query("DROP TABLE IF EXISTS full_join_right_dist")
+        node.query("DROP TABLE IF EXISTS full_join_left_local")
+        node.query("DROP TABLE IF EXISTS full_join_right_local")
+
+        node.query(
+            "CREATE TABLE full_join_left_local (id UInt64, left_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE full_join_right_local (id UInt64, right_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE full_join_left_dist AS full_join_left_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, full_join_left_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE full_join_right_dist AS full_join_right_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, full_join_right_local, rand())"
+        )
+
+    try:
+        node1.query("INSERT INTO full_join_left_local VALUES (1, 'l1_node1')")
+        node2.query("INSERT INTO full_join_left_local VALUES (2, 'l2_node2')")
+
+        node1.query("INSERT INTO full_join_right_local VALUES (2, 'r2_node1')")
+        node2.query("INSERT INTO full_join_right_local VALUES (3, 'r3_node2')")
+
+        query = """
+            SELECT l.id AS left_id, l.left_value AS left_value,
+                   r.id AS right_id, r.right_value AS right_value
+            FROM full_join_left_dist AS l
+            FULL ALL JOIN full_join_right_dist AS r ON l.id = r.id
+            ORDER BY left_id, right_id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(query).splitlines() == [
+            "0\t\t3\tr3_node2",
+            "1\tl1_node1\t0\t",
+            "2\tl2_node2\t2\tr2_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        left_filter_query = """
+            SELECT l.id AS left_id, l.left_value AS left_value,
+                   r.id AS right_id, r.right_value AS right_value
+            FROM full_join_left_dist AS l
+            FULL ALL JOIN full_join_right_dist AS r ON l.id = r.id
+            WHERE l.left_value = ''
+            ORDER BY left_id, right_id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(left_filter_query).splitlines() == [
+            "0\t\t3\tr3_node2",
+        ]
+        assert_no_shuffle_tables()
+
+        right_filter_query = """
+            SELECT l.id AS left_id, l.left_value AS left_value,
+                   r.id AS right_id, r.right_value AS right_value
+            FROM full_join_left_dist AS l
+            FULL ALL JOIN full_join_right_dist AS r ON l.id = r.id
+            WHERE r.right_value = ''
+            ORDER BY left_id, right_id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(right_filter_query).splitlines() == [
+            "1\tl1_node1\t0\t",
+        ]
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS full_join_left_dist")
+            node.query("DROP TABLE IF EXISTS full_join_right_dist")
+            node.query("DROP TABLE IF EXISTS full_join_left_local")
+            node.query("DROP TABLE IF EXISTS full_join_right_local")
+
+
 def test_exchange_profile_events_are_logged(started_cluster):
     query_id = f"shuffle_profile_events_{uuid.uuid4().hex}"
     query = """
@@ -309,6 +678,44 @@ def test_global_order_by_limit_offset_uses_shuffle_join(started_cluster):
     assert result.strip().splitlines() == [
         "3\tl3_node2\tr3_node1",
         "2\tl2_node1\tr2_node2",
+    ]
+    assert_no_shuffle_tables()
+
+
+def test_hidden_global_order_by_uses_shuffle_join(started_cluster):
+    query = """
+        SELECT l.left_value AS left_value, r.right_value AS right_value
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        ORDER BY l.id DESC
+        LIMIT 2 OFFSET 1
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    result = node1.query(query)
+
+    assert result.strip().splitlines() == [
+        "l3_node2\tr3_node1",
+        "l2_node1\tr2_node2",
+    ]
+    assert_no_shuffle_tables()
+
+
+def test_global_limit_with_ties_uses_shuffle_join(started_cluster):
+    query = """
+        SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        ORDER BY modulo(l.id, 2) ASC
+        LIMIT 1 WITH TIES
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    result = node1.query(query)
+
+    assert sorted_tsv(result) == [
+        "2\tl2_node1\tr2_node2",
+        "4\tl4_node2\tr4_node1",
     ]
     assert_no_shuffle_tables()
 
