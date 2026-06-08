@@ -928,11 +928,16 @@ SETTINGS distributed_shuffle_join = 1
 - coordinator 目前完成 `Prepare`、`Exchange` 调度入口、`Barrier -> Local JOIN` result pipeline 和 `Cleanup`，并已有基于 `ConnectionPoolWithFailover` 的真实 query executor。
 - 已在 `InterpreterSelectQueryAnalyzer::execute` 接入真实 distributed query path 的 MVP hook，并已手动跑通真实两节点 server demo；完整 Praktika integration job 也已通过。
 - 当前覆盖 `INNER ALL JOIN` / `INNER ANY JOIN` / `LEFT ALL JOIN` / `LEFT ANY JOIN` / `RIGHT ALL JOIN` / `RIGHT ANY JOIN` / `FULL ALL JOIN` / `LEFT SEMI JOIN` / `LEFT ANTI JOIN` / `RIGHT SEMI JOIN` / `RIGHT ANTI JOIN`、简单直接列 projection、deterministic expression projection、可下推到单表 source 的 deterministic `WHERE` 子条件、可在 target shard Local `JOIN` 后执行的 deterministic post-join filter、按已输出或隐藏 deterministic 表达式进行的全局 `ORDER BY`，以及普通常量 `LIMIT` / `OFFSET` 和带全局排序的 `LIMIT WITH TIES`；`FULL ANY JOIN`、聚合、其他特殊 join 语义和特殊排序语义等仍由 analyzer 保守拒绝。
+- 当前仍只支持一次二元分布式 `JOIN`，不支持多分布式表 `JOIN`。后续多表主线设计记录在 `docs/distributed_shuffle_join_multi_table_design.md`：第一步优先做左深树多阶段二元 shuffle，按 SQL 原始顺序执行；同 key multi-way shuffle 先作为后续优化，而不是多表正确性的前置条件。
 
 下一步建议：
 
-1. 后续逐步放开 query 形态：优先考虑聚合以及更多排序语义。
-2. 在 opportunistic cleanup 基础上继续实现常驻后台超时扫描，使恢复后没有新 shuffle 流量的空闲 shard 也能回收遗留 `_shuffle_*` 表。
+1. 优先推进多分布式表 `JOIN` 的左深树多阶段二元 shuffle：把当前单次二元 `Prepare -> Exchange -> Local JOIN -> Cleanup` 抽象成可重复的 `ShuffleJoinStage`，非最终 stage 将结果写入 stage output `Memory` 表，下一 stage 再读取该中间表继续 shuffle。
+2. 第一版多表按 SQL 原始 join 顺序执行，不做 join reorder、不做 cost model、不做同 key multi-way 合并；先只覆盖直接 `StorageDistributed` 输入和 `INNER ALL` / 普通 `INNER JOIN`。
+3. 多阶段路径跑通后，再增加 partitioning property 传递，判断上一 stage output 是否已经按下一 stage key 分布，从而避免不必要的 reshuffle。
+4. 再之后实现 cost model / join reorder，选择更低网络传输、更小中间结果、更低内存压力的 join 顺序。
+5. 同 key multi-way shuffle 作为后续性能优化：识别 `a.k = b.k = c.k` 这类 key equivalence class 后，将多个同 key stage 合并成一次 N-way shuffle。
+6. 在 opportunistic cleanup 基础上继续实现常驻后台超时扫描，使恢复后没有新 shuffle 流量的空闲 shard 也能回收遗留 `_shuffle_*` 表。
 
 ### 未来产品化方向
 
@@ -942,6 +947,7 @@ MVP 完成后，再逐步做产品化能力：
 - 增加网络 backpressure、限流、压缩、block squashing，避免 all-to-all shuffle 在大集群中打满连接池和网络。
 - 支持失败传播和取消清理，包括 source 失败、target 失败、initiator 取消、超时、连接断开。
 - 支持 parallel replicas 和 replica 选择策略。
+- 支持多分布式表 `JOIN`：先做左深树多阶段二元 shuffle，再做 partitioning property 传递、cost model / join reorder，最后把同 key多表查询优化为一次 multi-way shuffle。
 - 支持更多 `JOIN` 类型、strictness、多 key、表达式 key、nullable key。
 - 增加 skew 观测和保护，例如每 bucket 行数、每 bucket 字节数、最大 bucket 限制和 fallback。
 - 增加 profile events 和 query log 字段，用于观察 shuffle rows、shuffle bytes、send time、receive time、barrier wait time、spill bytes。
