@@ -10,6 +10,8 @@
 #include <Storages/DistributedShuffleJoinSink.h>
 
 #include <memory>
+#include <optional>
+#include <vector>
 
 namespace DB
 {
@@ -53,6 +55,15 @@ struct DistributedShuffleJoinExecutionPlan
     std::optional<UInt64> limit_length;
     UInt64 limit_offset = 0;
     bool limit_with_ties = false;
+};
+
+struct DistributedShuffleJoinLeftDeepStagePlan
+{
+    DistributedShuffleJoinInfo info;
+    DistributedShuffleJoinExecutionPlan execution_plan;
+    std::optional<String> output_table;
+    std::optional<String> qualified_output_table;
+    Block output_header;
 };
 
 class IDistributedShuffleJoinExchangeSideExecutor
@@ -171,6 +182,11 @@ DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
     ContextPtr context,
     size_t join_id,
     const DistributedShuffleJoinInfo & info);
+std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoinLeftDeepStagePlans(
+    const DistributedShuffleJoinLeftDeepInfo & info,
+    const String & initial_query_id,
+    size_t join_id,
+    UInt64 expiration_time_ms);
 
 std::shared_ptr<DistributedShuffleJoinSink> createDistributedShuffleJoinExchangeSink(
     ClusterPtr cluster,
@@ -240,6 +256,10 @@ BlockIO executeDistributedShuffleJoinClusterLocalJoinPipeline(
     std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator);
 BlockIO executeDistributedShuffleJoinPipeline(
     const DistributedShuffleJoinInfo & info,
+    ContextPtr context,
+    size_t join_id);
+BlockIO executeDistributedShuffleJoinLeftDeepPipeline(
+    const DistributedShuffleJoinLeftDeepInfo & info,
     ContextPtr context,
     size_t join_id);
 void executeDistributedShuffleJoinLocalJoinAndCleanup(

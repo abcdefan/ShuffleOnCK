@@ -1762,9 +1762,12 @@ static BlockIO executeQueryImpl(
                     const bool can_use_distributed_shuffle_join
                         = query_settings[Setting::distributed_shuffle_join]
                         && stage == QueryProcessingStage::Complete
-                        && tryAnalyzeDistributedShuffleJoin(
-                            interpreter_with_analyzer->getQueryTree(),
-                            interpreter_with_analyzer->getContext()).has_value();
+                        && (tryAnalyzeDistributedShuffleJoinLeftDeep(
+                                interpreter_with_analyzer->getQueryTree(),
+                                interpreter_with_analyzer->getContext()).has_value()
+                            || tryAnalyzeDistributedShuffleJoin(
+                                interpreter_with_analyzer->getQueryTree(),
+                                interpreter_with_analyzer->getContext()).has_value());
 
                     if (!can_use_distributed_shuffle_join)
                         interpreter_with_analyzer->getQueryPlan();

@@ -73,6 +73,21 @@ def query_log_profile_event_sum(node, query_id, event_name):
     )
 
 
+def query_log_source_query_count(node, query_id, side, query_condition):
+    return int(
+        node.query(
+            f"""
+            SELECT count()
+            FROM system.query_log
+            WHERE type = 'QueryStart'
+              AND startsWith(query_id, '{query_id}:shuffle:')
+              AND endsWith(query_id, ':source:{side}')
+              AND {query_condition}
+            """
+        ).strip()
+    )
+
+
 def test_inner_all_join_uses_push_based_shuffle(started_cluster):
     query = """
         SELECT l.id AS id, l.left_value AS left_value, r.right_value AS right_value
@@ -109,6 +124,850 @@ def test_inner_all_join_using_key_uses_push_based_shuffle(started_cluster):
         "4\tl4_node2\tr4_node1",
     ]
     assert_no_shuffle_tables()
+
+
+def test_left_deep_three_table_join_uses_multi_stage_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS left_deep_a_dist")
+        node.query("DROP TABLE IF EXISTS left_deep_b_dist")
+        node.query("DROP TABLE IF EXISTS left_deep_c_dist")
+        node.query("DROP TABLE IF EXISTS left_deep_a_local")
+        node.query("DROP TABLE IF EXISTS left_deep_b_local")
+        node.query("DROP TABLE IF EXISTS left_deep_c_local")
+
+        node.query(
+            "CREATE TABLE left_deep_a_local "
+            "(id UInt64, a_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep_b_local "
+            "(id UInt64, bucket UInt64, b_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep_c_local "
+            "(bucket UInt64, c_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep_a_dist AS left_deep_a_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep_a_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_deep_b_dist AS left_deep_b_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep_b_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_deep_c_dist AS left_deep_c_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep_c_local, rand())"
+        )
+
+    try:
+        node1.query(
+            "INSERT INTO left_deep_a_local VALUES "
+            "(1, 'a1_node1'), (2, 'a2_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep_a_local VALUES "
+            "(3, 'a3_node2'), (4, 'a4_node2')"
+        )
+
+        node1.query(
+            "INSERT INTO left_deep_b_local VALUES "
+            "(3, 30, 'b3_node1'), (4, 40, 'b4_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep_b_local VALUES "
+            "(1, 10, 'b1_node2'), (2, 20, 'b2_node2')"
+        )
+
+        node1.query(
+            "INSERT INTO left_deep_c_local VALUES "
+            "(20, 'c20_node1'), (40, 'c40_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep_c_local VALUES "
+            "(10, 'c10_node2'), (30, 'c30_node2')"
+        )
+
+        query_id = f"shuffle_left_deep_scan_{uuid.uuid4().hex}"
+        query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+                log_queries = 1, log_queries_min_type = 'QUERY_START'
+        """
+
+        assert node1.query(query, query_id=query_id).splitlines() == [
+            "1\ta1_node1\tb1_node2\tc10_node2",
+            "2\ta2_node1\tb2_node2\tc20_node1",
+            "3\ta3_node2\tb3_node1\tc30_node2",
+            "4\ta4_node2\tb4_node1\tc40_node1",
+        ]
+
+        for node in (node1, node2):
+            node.query("SYSTEM FLUSH LOGS query_log")
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "left",
+                    "position(query, 'FROM default.left_deep_a_local') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "right",
+                    "position(query, 'FROM default.left_deep_b_local') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "left",
+                    "position(query, '_output') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "right",
+                    "position(query, 'FROM default.left_deep_c_local') > 0",
+                )
+                == 1
+            )
+        assert_no_shuffle_tables()
+
+        filtered_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            WHERE a.id >= 2 AND c.bucket != 30 AND a.id + c.bucket >= 30
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(filtered_query).splitlines() == [
+            "4\ta4_node2\tb4_node1\tc40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        previous_stage_right_filter_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            WHERE b.b_value = 'b2_node2'
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(previous_stage_right_filter_query).splitlines() == [
+            "2\ta2_node1\tb2_node2\tc20_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        filter_pushdown_query_id = f"shuffle_left_deep_filter_pushdown_{uuid.uuid4().hex}"
+        filter_pushdown_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            WHERE a.id >= 2 AND b.b_value = 'b2_node2' AND c.bucket = 20
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+                log_queries = 1, log_queries_min_type = 'QUERY_START'
+        """
+
+        assert node1.query(
+            filter_pushdown_query, query_id=filter_pushdown_query_id
+        ).splitlines() == [
+            "2\ta2_node1\tb2_node2\tc20_node1",
+        ]
+
+        for node in (node1, node2):
+            node.query("SYSTEM FLUSH LOGS query_log")
+            assert (
+                query_log_source_query_count(
+                    node,
+                    filter_pushdown_query_id,
+                    "left",
+                    "position(query, 'FROM default.left_deep_a_local WHERE') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    filter_pushdown_query_id,
+                    "right",
+                    "position(query, 'FROM default.left_deep_b_local WHERE') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    filter_pushdown_query_id,
+                    "right",
+                    "position(query, 'FROM default.left_deep_c_local WHERE') > 0",
+                )
+                == 1
+            )
+        assert_no_shuffle_tables()
+
+        pruned_filter_column_query = """
+            SELECT a.id AS id
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            WHERE b.b_value = 'b2_node2'
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(pruned_filter_column_query).splitlines() == [
+            "2",
+        ]
+        assert_no_shuffle_tables()
+
+        plain_join_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(plain_join_query).splitlines() == [
+            "1\ta1_node1\tb1_node2\tc10_node2",
+            "2\ta2_node1\tb2_node2\tc20_node1",
+            "3\ta3_node2\tb3_node1\tc30_node2",
+            "4\ta4_node2\tb4_node1\tc40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        expression_projection_query = """
+            SELECT
+                a.id AS id,
+                concat(a.a_value, ':', b.b_value, ':', c.c_value) AS joined_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(expression_projection_query).splitlines() == [
+            "1\ta1_node1:b1_node2:c10_node2",
+            "2\ta2_node1:b2_node2:c20_node1",
+            "3\ta3_node2:b3_node1:c30_node2",
+            "4\ta4_node2:b4_node1:c40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        global_order_limit_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id DESC
+            LIMIT 2 OFFSET 1
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(global_order_limit_query).splitlines() == [
+            "3\ta3_node2\tb3_node1\tc30_node2",
+            "2\ta2_node1\tb2_node2\tc20_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        hidden_order_limit_query = """
+            SELECT
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY a.id DESC
+            LIMIT 2 OFFSET 1
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(hidden_order_limit_query).splitlines() == [
+            "a3_node2\tb3_node1\tc30_node2",
+            "a2_node1\tb2_node2\tc20_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        limit_with_ties_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY modulo(a.id, 2) ASC
+            LIMIT 1 WITH TIES
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert sorted_tsv(node1.query(limit_with_ties_query)) == [
+            "2\ta2_node1\tb2_node2\tc20_node1",
+            "4\ta4_node2\tb4_node1\tc40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        duplicate_column_query = """
+            SELECT
+                a.id AS a_id,
+                b.id AS b_id,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY a_id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(duplicate_column_query).splitlines() == [
+            "1\t1\tc10_node2",
+            "2\t2\tc20_node1",
+            "3\t3\tc30_node2",
+            "4\t4\tc40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        duplicate_column_filter_query = """
+            SELECT
+                a.id AS a_id,
+                b.id AS b_id,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            WHERE a.id + b.id = 4
+            ORDER BY a_id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(duplicate_column_filter_query).splitlines() == [
+            "2\t2\tc20_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        early_post_join_filter_pruned_query = """
+            SELECT c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            WHERE a.id + b.id = 4
+            ORDER BY c_value
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(early_post_join_filter_pruned_query).splitlines() == [
+            "c20_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        using_join_query = """
+            SELECT
+                id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b USING (id)
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(using_join_query).splitlines() == [
+            "1\ta1_node1\tb1_node2\tc10_node2",
+            "2\ta2_node1\tb2_node2\tc20_node1",
+            "3\ta3_node2\tb3_node1\tc30_node2",
+            "4\ta4_node2\tb4_node1\tc40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        later_stage_using_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c USING (bucket)
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(later_stage_using_query).splitlines() == [
+            "1\ta1_node1\tb1_node2\tc10_node2",
+            "2\ta2_node1\tb2_node2\tc20_node1",
+            "3\ta3_node2\tb3_node1\tc30_node2",
+            "4\ta4_node2\tb4_node1\tc40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        expired_stage_output_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+                distributed_shuffle_join_table_ttl_ms = 1
+        """
+
+        assert node1.query(expired_stage_output_query).splitlines() == [
+            "1\ta1_node1\tb1_node2\tc10_node2",
+            "2\ta2_node1\tb2_node2\tc20_node1",
+            "3\ta3_node2\tb3_node1\tc30_node2",
+            "4\ta4_node2\tb4_node1\tc40_node1",
+        ]
+        assert_no_shuffle_tables()
+
+        node1.query("INSERT INTO left_deep_b_local VALUES (1, 10, 'b1_dup_node1')")
+
+        any_join_query = """
+            SELECT
+                a.id AS id
+            FROM left_deep_a_dist AS a
+            ANY INNER JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(any_join_query).splitlines() == [
+            "1",
+            "2",
+            "3",
+            "4",
+        ]
+        assert_no_shuffle_tables()
+
+        node1.query("INSERT INTO left_deep_c_local VALUES (10, 'c10_dup_node1')")
+
+        second_stage_any_join_query = """
+            SELECT
+                a.id AS id
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            ANY INNER JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+                any_join_distinct_right_table_keys = 0
+        """
+
+        assert node1.query(second_stage_any_join_query).splitlines() == [
+            "1",
+            "2",
+            "3",
+            "4",
+        ]
+        assert_no_shuffle_tables()
+
+        node2.query("DROP TABLE left_deep_c_local")
+
+        second_stage_exchange_failure_query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        error = node1.query_and_get_error(second_stage_exchange_failure_query)
+
+        assert "left_deep_c_local" in error
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS left_deep_a_dist")
+            node.query("DROP TABLE IF EXISTS left_deep_b_dist")
+            node.query("DROP TABLE IF EXISTS left_deep_c_dist")
+            node.query("DROP TABLE IF EXISTS left_deep_a_local")
+            node.query("DROP TABLE IF EXISTS left_deep_b_local")
+            node.query("DROP TABLE IF EXISTS left_deep_c_local")
+
+
+def test_left_deep_using_chain_join_uses_multi_stage_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS left_deep_using_a_dist")
+        node.query("DROP TABLE IF EXISTS left_deep_using_b_dist")
+        node.query("DROP TABLE IF EXISTS left_deep_using_c_dist")
+        node.query("DROP TABLE IF EXISTS left_deep_using_a_local")
+        node.query("DROP TABLE IF EXISTS left_deep_using_b_local")
+        node.query("DROP TABLE IF EXISTS left_deep_using_c_local")
+
+        node.query(
+            "CREATE TABLE left_deep_using_a_local "
+            "(id UInt64, a_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep_using_b_local "
+            "(id UInt64, b_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep_using_c_local "
+            "(id UInt64, c_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep_using_a_dist AS left_deep_using_a_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep_using_a_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_deep_using_b_dist AS left_deep_using_b_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep_using_b_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_deep_using_c_dist AS left_deep_using_c_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep_using_c_local, rand())"
+        )
+
+    try:
+        node1.query(
+            "INSERT INTO left_deep_using_a_local VALUES "
+            "(1, 'a1_node1'), (2, 'a2_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep_using_a_local VALUES "
+            "(3, 'a3_node2'), (4, 'a4_node2')"
+        )
+
+        node1.query(
+            "INSERT INTO left_deep_using_b_local VALUES "
+            "(3, 'b3_node1'), (4, 'b4_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep_using_b_local VALUES "
+            "(1, 'b1_node2'), (2, 'b2_node2')"
+        )
+
+        node1.query(
+            "INSERT INTO left_deep_using_c_local VALUES "
+            "(2, 'c2_node1'), (4, 'c4_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep_using_c_local VALUES "
+            "(1, 'c1_node2'), (3, 'c3_node2')"
+        )
+
+        query = """
+            SELECT
+                id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value
+            FROM left_deep_using_a_dist AS a
+            INNER ALL JOIN left_deep_using_b_dist AS b USING (id)
+            INNER ALL JOIN left_deep_using_c_dist AS c USING (id)
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(query).splitlines() == [
+            "1\ta1_node1\tb1_node2\tc1_node2",
+            "2\ta2_node1\tb2_node2\tc2_node1",
+            "3\ta3_node2\tb3_node1\tc3_node2",
+            "4\ta4_node2\tb4_node1\tc4_node1",
+        ]
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS left_deep_using_a_dist")
+            node.query("DROP TABLE IF EXISTS left_deep_using_b_dist")
+            node.query("DROP TABLE IF EXISTS left_deep_using_c_dist")
+            node.query("DROP TABLE IF EXISTS left_deep_using_a_local")
+            node.query("DROP TABLE IF EXISTS left_deep_using_b_local")
+            node.query("DROP TABLE IF EXISTS left_deep_using_c_local")
+
+
+def test_left_deep_outer_join_preserves_regular_distributed_join_exception(
+    started_cluster,
+):
+    query = """
+        SELECT l.id AS id
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        LEFT ALL JOIN left_dist AS x ON r.id = x.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    error = node1.query_and_get_error(query)
+
+    assert "Double-distributed IN/JOIN subqueries is denied" in error
+    assert_no_shuffle_tables()
+
+
+def test_left_deep_semi_join_preserves_regular_distributed_join_exception(
+    started_cluster,
+):
+    query = """
+        SELECT l.id AS id
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        LEFT SEMI JOIN left_dist AS x ON r.id = x.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    error = node1.query_and_get_error(query)
+
+    assert "Double-distributed IN/JOIN subqueries is denied" in error
+    assert_no_shuffle_tables()
+
+
+def test_left_deep_expression_key_preserves_regular_distributed_join_exception(
+    started_cluster,
+):
+    query = """
+        SELECT l.id AS id
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        INNER ALL JOIN left_dist AS x ON r.id + 0 = x.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    error = node1.query_and_get_error(query)
+
+    assert "Double-distributed IN/JOIN subqueries is denied" in error
+    assert_no_shuffle_tables()
+
+
+def test_left_deep_compound_key_preserves_regular_distributed_join_exception(
+    started_cluster,
+):
+    query = """
+        SELECT l.id AS id
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        INNER ALL JOIN left_dist AS x ON r.id = x.id AND l.id = x.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    error = node1.query_and_get_error(query)
+
+    assert "Double-distributed IN/JOIN subqueries is denied" in error
+    assert_no_shuffle_tables()
+
+
+def test_left_deep_aggregation_preserves_regular_distributed_join_exception(
+    started_cluster,
+):
+    query = """
+        SELECT l.id AS id, count() AS count
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        INNER ALL JOIN left_dist AS x ON r.id = x.id
+        GROUP BY l.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    error = node1.query_and_get_error(query)
+
+    assert "Double-distributed IN/JOIN subqueries is denied" in error
+    assert_no_shuffle_tables()
+
+
+def test_left_deep_distinct_preserves_regular_distributed_join_exception(
+    started_cluster,
+):
+    query = """
+        SELECT DISTINCT l.id AS id
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        INNER ALL JOIN left_dist AS x ON r.id = x.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    error = node1.query_and_get_error(query)
+
+    assert "Double-distributed IN/JOIN subqueries is denied" in error
+    assert_no_shuffle_tables()
+
+
+def test_left_deep_parallel_replicas_preserves_regular_distributed_join_exception(
+    started_cluster,
+):
+    query = """
+        SELECT l.id AS id
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        INNER ALL JOIN left_dist AS x ON r.id = x.id
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+            allow_experimental_parallel_reading_from_replicas = 1
+    """
+
+    error = node1.query_and_get_error(query)
+
+    assert "Double-distributed IN/JOIN subqueries is denied" in error
+    assert_no_shuffle_tables()
+
+
+def test_left_deep_four_table_join_uses_n_stage_shuffle(started_cluster):
+    for node in (node1, node2):
+        node.query("DROP TABLE IF EXISTS left_deep4_a_dist")
+        node.query("DROP TABLE IF EXISTS left_deep4_b_dist")
+        node.query("DROP TABLE IF EXISTS left_deep4_c_dist")
+        node.query("DROP TABLE IF EXISTS left_deep4_d_dist")
+        node.query("DROP TABLE IF EXISTS left_deep4_a_local")
+        node.query("DROP TABLE IF EXISTS left_deep4_b_local")
+        node.query("DROP TABLE IF EXISTS left_deep4_c_local")
+        node.query("DROP TABLE IF EXISTS left_deep4_d_local")
+
+        node.query(
+            "CREATE TABLE left_deep4_a_local "
+            "(id UInt64, a_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep4_b_local "
+            "(id UInt64, bucket UInt64, b_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep4_c_local "
+            "(bucket UInt64, group_id UInt64, c_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep4_d_local "
+            "(group_id UInt64, d_value String) ENGINE = Memory"
+        )
+        node.query(
+            "CREATE TABLE left_deep4_a_dist AS left_deep4_a_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep4_a_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_deep4_b_dist AS left_deep4_b_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep4_b_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_deep4_c_dist AS left_deep4_c_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep4_c_local, rand())"
+        )
+        node.query(
+            "CREATE TABLE left_deep4_d_dist AS left_deep4_d_local "
+            "ENGINE = Distributed(shuffle_join_cluster, default, left_deep4_d_local, rand())"
+        )
+
+    try:
+        node1.query(
+            "INSERT INTO left_deep4_a_local VALUES "
+            "(1, 'a1_node1'), (2, 'a2_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep4_a_local VALUES "
+            "(3, 'a3_node2'), (4, 'a4_node2')"
+        )
+
+        node1.query(
+            "INSERT INTO left_deep4_b_local VALUES "
+            "(3, 30, 'b3_node1'), (4, 40, 'b4_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep4_b_local VALUES "
+            "(1, 10, 'b1_node2'), (2, 20, 'b2_node2')"
+        )
+
+        node1.query(
+            "INSERT INTO left_deep4_c_local VALUES "
+            "(20, 200, 'c20_node1'), (40, 400, 'c40_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep4_c_local VALUES "
+            "(10, 100, 'c10_node2'), (30, 300, 'c30_node2')"
+        )
+
+        node1.query(
+            "INSERT INTO left_deep4_d_local VALUES "
+            "(100, 'd100_node1'), (300, 'd300_node1')"
+        )
+        node2.query(
+            "INSERT INTO left_deep4_d_local VALUES "
+            "(200, 'd200_node2'), (400, 'd400_node2')"
+        )
+
+        query = """
+            SELECT
+                a.id AS id,
+                a.a_value AS a_value,
+                b.b_value AS b_value,
+                c.c_value AS c_value,
+                d.d_value AS d_value
+            FROM left_deep4_a_dist AS a
+            INNER ALL JOIN left_deep4_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep4_c_dist AS c ON b.bucket = c.bucket
+            INNER ALL JOIN left_deep4_d_dist AS d ON c.group_id = d.group_id
+            ORDER BY id
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        assert node1.query(query).splitlines() == [
+            "1\ta1_node1\tb1_node2\tc10_node2\td100_node1",
+            "2\ta2_node1\tb2_node2\tc20_node1\td200_node2",
+            "3\ta3_node2\tb3_node1\tc30_node2\td300_node1",
+            "4\ta4_node2\tb4_node1\tc40_node1\td400_node2",
+        ]
+        assert_no_shuffle_tables()
+    finally:
+        for node in (node1, node2):
+            node.query("DROP TABLE IF EXISTS left_deep4_a_dist")
+            node.query("DROP TABLE IF EXISTS left_deep4_b_dist")
+            node.query("DROP TABLE IF EXISTS left_deep4_c_dist")
+            node.query("DROP TABLE IF EXISTS left_deep4_d_dist")
+            node.query("DROP TABLE IF EXISTS left_deep4_a_local")
+            node.query("DROP TABLE IF EXISTS left_deep4_b_local")
+            node.query("DROP TABLE IF EXISTS left_deep4_c_local")
+            node.query("DROP TABLE IF EXISTS left_deep4_d_local")
 
 
 def test_inner_any_join_uses_push_based_shuffle(started_cluster):

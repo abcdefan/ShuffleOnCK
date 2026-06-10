@@ -617,6 +617,21 @@ TEST(DistributedShuffleJoin, ExchangeSourceQueryNeedsDistributedStorage)
         Exception);
 }
 
+TEST(DistributedShuffleJoin, ExchangeSourceQueryUsesExplicitSource)
+{
+    auto info = makeExchangeInfo();
+    info.left_source_database = "shuffle db";
+    info.left_source_table = "_shuffle_previous_stage_output";
+    info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(info, DistributedShuffleJoinTableSide::Left),
+        "SELECT id, bucket FROM `shuffle db`._shuffle_previous_stage_output");
+}
+
 TEST(DistributedShuffleJoin, CreatesLocalJoinQuery)
 {
     auto info = makeExchangeInfo();
@@ -895,6 +910,366 @@ TEST(DistributedShuffleJoin, CreatesExecutionPlan)
         "ON _shuffle_left.id = _shuffle_right.id");
 }
 
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansWithIntermediateOutputSource)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    DistributedShuffleJoinLeftDeepStageInfo first_stage;
+    first_stage.info = makeExchangeInfo();
+    first_stage.info.cluster_name = "distributed_shuffle_join_test";
+    first_stage.info.shuffle_database = "shuffle db";
+    first_stage.info.left_source_database = "remote";
+    first_stage.info.left_source_table = "a_local";
+    first_stage.info.right_source_database = "remote";
+    first_stage.info.right_source_table = "b_local";
+    first_stage.info.right_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+    first_stage.info.projection_columns = {
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = true,
+            .is_hidden = false,
+            .source_column_name = "id",
+            .expression = "",
+            .result_column_name = "id"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = false,
+            .source_column_name = "bucket",
+            .expression = "",
+            .result_column_name = "_shuffle_stage_col_1_bucket"},
+    };
+    first_stage.output_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"_shuffle_stage_col_1_bucket", std::make_shared<DataTypeUInt64>()},
+    };
+
+    DistributedShuffleJoinLeftDeepStageInfo second_stage;
+    second_stage.info = makeExchangeInfo();
+    second_stage.info.cluster_name = "distributed_shuffle_join_test";
+    second_stage.info.shuffle_database = "shuffle db";
+    second_stage.info.left_source_database = "should_be_replaced";
+    second_stage.info.left_source_table = "should_be_replaced";
+    second_stage.info.right_source_database = "remote";
+    second_stage.info.right_source_table = "c_local";
+    second_stage.info.left_key_column_name = "_shuffle_stage_col_1_bucket";
+    second_stage.info.right_key_column_name = "bucket";
+    second_stage.info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"_shuffle_stage_col_1_bucket", std::make_shared<DataTypeUInt64>()},
+    };
+    second_stage.info.right_required_columns = {
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+        {"value", std::make_shared<DataTypeUInt64>()},
+    };
+
+    left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+
+    const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
+        left_deep_info,
+        "left-deep-plan-test",
+        42,
+        /*expiration_time_ms=*/0);
+
+    ASSERT_EQ(stage_plans.size(), 2);
+
+    EXPECT_EQ(stage_plans[0].execution_plan.table_names.left_table, "_shuffle_left_deep_plan_test_42000_left");
+    ASSERT_TRUE(stage_plans[0].output_table.has_value());
+    EXPECT_EQ(*stage_plans[0].output_table, "_shuffle_left_deep_plan_test_42000_output");
+    ASSERT_TRUE(stage_plans[0].qualified_output_table.has_value());
+    EXPECT_EQ(*stage_plans[0].qualified_output_table, "`shuffle db`._shuffle_left_deep_plan_test_42000_output");
+    ASSERT_EQ(stage_plans[0].output_header.columns(), 2);
+    EXPECT_EQ(stage_plans[0].output_header.getByPosition(0).name, "id");
+    EXPECT_EQ(stage_plans[0].output_header.getByPosition(1).name, "_shuffle_stage_col_1_bucket");
+
+    EXPECT_EQ(stage_plans[1].info.left_source_database, "shuffle db");
+    EXPECT_EQ(stage_plans[1].info.left_source_table, "_shuffle_left_deep_plan_test_42000_output");
+    EXPECT_FALSE(stage_plans[1].output_table.has_value());
+
+    const auto second_stage_payload = createDistributedShuffleJoinExchangePayload(
+        stage_plans[1].execution_plan.table_names,
+        stage_plans[1].info);
+    EXPECT_EQ(second_stage_payload.left_source.database, "shuffle db");
+    EXPECT_EQ(second_stage_payload.left_source.table, "_shuffle_left_deep_plan_test_42000_output");
+    EXPECT_EQ(second_stage_payload.right_source.database, "remote");
+    EXPECT_EQ(second_stage_payload.right_source.table, "c_local");
+
+    EXPECT_EQ(
+        stage_plans[1].execution_plan.local_join_query,
+        "SELECT * FROM `shuffle db`._shuffle_left_deep_plan_test_42001_left AS _shuffle_left "
+        "INNER ALL JOIN `shuffle db`._shuffle_left_deep_plan_test_42001_right AS _shuffle_right "
+        "ON _shuffle_left._shuffle_stage_col_1_bucket = _shuffle_right.bucket");
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansPruneEarlyFilterOnlyColumns)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    DistributedShuffleJoinLeftDeepStageInfo first_stage;
+    first_stage.info = makeExchangeInfo();
+    first_stage.info.cluster_name = "distributed_shuffle_join_test";
+    first_stage.info.shuffle_database = "shuffle db";
+    first_stage.info.left_source_database = "remote";
+    first_stage.info.left_source_table = "a_local";
+    first_stage.info.right_source_database = "remote";
+    first_stage.info.right_source_table = "b_local";
+    first_stage.info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"filter_value", std::make_shared<DataTypeUInt64>()},
+    };
+    first_stage.info.right_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+        {"filter_value", std::make_shared<DataTypeUInt64>()},
+    };
+    first_stage.info.post_join_filter_condition = "_shuffle_left.filter_value = _shuffle_right.filter_value";
+    first_stage.info.projection_columns = {
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = true,
+            .is_hidden = false,
+            .source_column_name = "id",
+            .expression = "",
+            .result_column_name = "id"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = false,
+            .source_column_name = "bucket",
+            .expression = "",
+            .result_column_name = "bucket"},
+    };
+    first_stage.output_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+
+    DistributedShuffleJoinLeftDeepStageInfo second_stage;
+    second_stage.info = makeExchangeInfo();
+    second_stage.info.cluster_name = "distributed_shuffle_join_test";
+    second_stage.info.shuffle_database = "shuffle db";
+    second_stage.info.left_source_database = "will_be_replaced";
+    second_stage.info.left_source_table = "will_be_replaced";
+    second_stage.info.right_source_database = "remote";
+    second_stage.info.right_source_table = "c_local";
+    second_stage.info.left_key_column_name = "bucket";
+    second_stage.info.right_key_column_name = "bucket";
+    second_stage.info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+    second_stage.info.right_required_columns = {
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+
+    left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+
+    const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
+        left_deep_info,
+        "left-deep-filter-prune-test",
+        5,
+        /*expiration_time_ms=*/0);
+
+    ASSERT_EQ(stage_plans.size(), 2);
+    ASSERT_TRUE(stage_plans[0].qualified_output_table.has_value());
+    EXPECT_EQ(
+        stage_plans[0].execution_plan.local_join_query,
+        "SELECT _shuffle_left.id AS id, _shuffle_right.bucket AS bucket "
+        "FROM `shuffle db`._shuffle_left_deep_filter_prune_test_5000_left AS _shuffle_left "
+        "INNER ALL JOIN `shuffle db`._shuffle_left_deep_filter_prune_test_5000_right AS _shuffle_right "
+        "ON _shuffle_left.id = _shuffle_right.id "
+        "WHERE _shuffle_left.filter_value = _shuffle_right.filter_value");
+
+    ASSERT_EQ(stage_plans[0].output_header.columns(), 2);
+    EXPECT_EQ(stage_plans[0].output_header.getByPosition(0).name, "id");
+    EXPECT_EQ(stage_plans[0].output_header.getByPosition(1).name, "bucket");
+    EXPECT_FALSE(stage_plans[0].output_header.has("filter_value"));
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansForNStages)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    DistributedShuffleJoinLeftDeepStageInfo first_stage;
+    first_stage.info = makeExchangeInfo();
+    first_stage.info.cluster_name = "distributed_shuffle_join_test";
+    first_stage.info.shuffle_database = "shuffle db";
+    first_stage.info.left_source_database = "remote";
+    first_stage.info.left_source_table = "a_local";
+    first_stage.info.right_source_database = "remote";
+    first_stage.info.right_source_table = "b_local";
+    first_stage.output_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+
+    DistributedShuffleJoinLeftDeepStageInfo second_stage;
+    second_stage.info = makeExchangeInfo();
+    second_stage.info.cluster_name = "distributed_shuffle_join_test";
+    second_stage.info.shuffle_database = "shuffle db";
+    second_stage.info.left_source_database = "will_be_replaced";
+    second_stage.info.left_source_table = "will_be_replaced";
+    second_stage.info.right_source_database = "remote";
+    second_stage.info.right_source_table = "c_local";
+    second_stage.output_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"group_id", std::make_shared<DataTypeUInt64>()},
+    };
+
+    DistributedShuffleJoinLeftDeepStageInfo third_stage;
+    third_stage.info = makeExchangeInfo();
+    third_stage.info.cluster_name = "distributed_shuffle_join_test";
+    third_stage.info.shuffle_database = "shuffle db";
+    third_stage.info.left_source_database = "will_be_replaced";
+    third_stage.info.left_source_table = "will_be_replaced";
+    third_stage.info.right_source_database = "remote";
+    third_stage.info.right_source_table = "d_local";
+
+    left_deep_info.stages = {std::move(first_stage), std::move(second_stage), std::move(third_stage)};
+
+    const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
+        left_deep_info,
+        "left-deep-n-stage-test",
+        3,
+        /*expiration_time_ms=*/0);
+
+    ASSERT_EQ(stage_plans.size(), 3);
+
+    ASSERT_TRUE(stage_plans[0].output_table.has_value());
+    ASSERT_TRUE(stage_plans[1].output_table.has_value());
+    EXPECT_FALSE(stage_plans[2].output_table.has_value());
+    EXPECT_EQ(*stage_plans[0].output_table, "_shuffle_left_deep_n_stage_test_3000_output");
+    EXPECT_EQ(*stage_plans[1].output_table, "_shuffle_left_deep_n_stage_test_3001_output");
+    EXPECT_NE(*stage_plans[0].output_table, *stage_plans[1].output_table);
+
+    EXPECT_EQ(stage_plans[1].info.left_source_database, "shuffle db");
+    EXPECT_EQ(stage_plans[1].info.left_source_table, "_shuffle_left_deep_n_stage_test_3000_output");
+    EXPECT_EQ(stage_plans[2].info.left_source_database, "shuffle db");
+    EXPECT_EQ(stage_plans[2].info.left_source_table, "_shuffle_left_deep_n_stage_test_3001_output");
+
+    EXPECT_EQ(stage_plans[0].execution_plan.table_names.left_table, "_shuffle_left_deep_n_stage_test_3000_left");
+    EXPECT_EQ(stage_plans[1].execution_plan.table_names.left_table, "_shuffle_left_deep_n_stage_test_3001_left");
+    EXPECT_EQ(stage_plans[2].execution_plan.table_names.left_table, "_shuffle_left_deep_n_stage_test_3002_left");
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansWithExpiringOutputTables)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    DistributedShuffleJoinLeftDeepStageInfo first_stage;
+    first_stage.info = makeExchangeInfo();
+    first_stage.info.cluster_name = "distributed_shuffle_join_test";
+    first_stage.info.shuffle_database = "shuffle db";
+    first_stage.info.left_source_database = "remote";
+    first_stage.info.left_source_table = "a_local";
+    first_stage.info.right_source_database = "remote";
+    first_stage.info.right_source_table = "b_local";
+    first_stage.output_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+    };
+
+    DistributedShuffleJoinLeftDeepStageInfo second_stage;
+    second_stage.info = makeExchangeInfo();
+    second_stage.info.cluster_name = "distributed_shuffle_join_test";
+    second_stage.info.shuffle_database = "shuffle db";
+    second_stage.info.left_source_database = "will_be_replaced";
+    second_stage.info.left_source_table = "will_be_replaced";
+    second_stage.info.right_source_database = "remote";
+    second_stage.info.right_source_table = "c_local";
+
+    left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+
+    const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
+        left_deep_info,
+        "left-deep-expiring-output-test",
+        9,
+        /*expiration_time_ms=*/987654);
+
+    ASSERT_EQ(stage_plans.size(), 2);
+
+    EXPECT_EQ(stage_plans[0].execution_plan.table_names.left_table, "_shuffle_left_deep_expiring_output_test_9000_expires_987654_left");
+    ASSERT_TRUE(stage_plans[0].output_table.has_value());
+    EXPECT_EQ(*stage_plans[0].output_table, "_shuffle_left_deep_expiring_output_test_9000_expires_987654_output");
+    EXPECT_EQ(tryGetDistributedShuffleJoinTableExpirationTimeMs(*stage_plans[0].output_table), 987654);
+
+    EXPECT_EQ(stage_plans[1].info.left_source_database, "shuffle db");
+    EXPECT_EQ(stage_plans[1].info.left_source_table, "_shuffle_left_deep_expiring_output_test_9000_expires_987654_output");
+    EXPECT_EQ(stage_plans[1].execution_plan.table_names.left_table, "_shuffle_left_deep_expiring_output_test_9001_expires_987654_left");
+    EXPECT_EQ(tryGetDistributedShuffleJoinTableExpirationTimeMs(stage_plans[1].execution_plan.table_names.left_table), 987654);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansPreserveFinalGlobalPostProcessing)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    DistributedShuffleJoinLeftDeepStageInfo first_stage;
+    first_stage.info = makeExchangeInfo();
+    first_stage.info.cluster_name = "distributed_shuffle_join_test";
+    first_stage.info.shuffle_database = "shuffle db";
+    first_stage.info.left_source_database = "remote";
+    first_stage.info.left_source_table = "a_local";
+    first_stage.info.right_source_database = "remote";
+    first_stage.info.right_source_table = "b_local";
+    first_stage.output_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+    };
+
+    DistributedShuffleJoinLeftDeepStageInfo second_stage;
+    second_stage.info = makeExchangeInfo();
+    second_stage.info.cluster_name = "distributed_shuffle_join_test";
+    second_stage.info.shuffle_database = "shuffle db";
+    second_stage.info.left_source_database = "will_be_replaced";
+    second_stage.info.left_source_table = "will_be_replaced";
+    second_stage.info.right_source_database = "remote";
+    second_stage.info.right_source_table = "c_local";
+    second_stage.info.projection_columns = {
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = true,
+            .is_hidden = false,
+            .source_column_name = "id",
+            .expression = "",
+            .result_column_name = "id"},
+        DistributedShuffleJoinProjectionColumn{
+            .is_left = false,
+            .is_hidden = true,
+            .source_column_name = "",
+            .expression = "_shuffle_left.id",
+            .result_column_name = "_shuffle_order_by_0"},
+    };
+    second_stage.info.order_by.emplace_back("_shuffle_order_by_0", 1, 1);
+    second_stage.info.limit_length = 1;
+    second_stage.info.limit_with_ties = true;
+
+    left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+
+    const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
+        left_deep_info,
+        "left-deep-final-post-processing-test",
+        11,
+        /*expiration_time_ms=*/0);
+
+    ASSERT_EQ(stage_plans.size(), 2);
+    const auto & final_plan = stage_plans[1].execution_plan;
+    EXPECT_FALSE(stage_plans[1].output_table.has_value());
+    EXPECT_TRUE(final_plan.has_hidden_projection_columns);
+    ASSERT_EQ(final_plan.visible_result_columns.size(), 1);
+    EXPECT_EQ(final_plan.visible_result_columns[0], "id");
+    ASSERT_EQ(final_plan.order_by.size(), 1);
+    EXPECT_EQ(final_plan.order_by[0].column_name, "_shuffle_order_by_0");
+    ASSERT_TRUE(final_plan.limit_length.has_value());
+    EXPECT_EQ(*final_plan.limit_length, 1);
+    EXPECT_TRUE(final_plan.limit_with_ties);
+}
+
 TEST(DistributedShuffleJoin, ExecutionPlanUsesUniqueFallbackQueryId)
 {
     auto context = Context::createCopy(getContext().context);
@@ -1035,6 +1410,41 @@ TEST(DistributedShuffleJoin, SerializesAndParsesRemoteExchangePayload)
         "SELECT `right key`, `right value` FROM default.`right local` WHERE `right value` < 20");
 }
 
+TEST(DistributedShuffleJoin, RemoteExchangePayloadUsesExplicitSources)
+{
+    auto info = makeExchangeInfo();
+    info.cluster_name = "test_cluster";
+    info.left_source_database = "shuffle db";
+    info.left_source_table = "_shuffle_previous_stage_output";
+    info.right_source_database = "default";
+    info.right_source_table = "right_local";
+    info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+    info.right_required_columns = {
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+        {"value", std::make_shared<DataTypeUInt64>()},
+    };
+
+    const auto table_names = createDistributedShuffleJoinTableNames(
+        "shuffle db",
+        DistributedShuffleJoinExchangeId{.initial_query_id = "explicit-source-payload-test", .join_id = 3});
+
+    const auto payload = createDistributedShuffleJoinExchangePayload(table_names, info);
+
+    EXPECT_EQ(payload.left_source.database, "shuffle db");
+    EXPECT_EQ(payload.left_source.table, "_shuffle_previous_stage_output");
+    EXPECT_EQ(payload.right_source.database, "default");
+    EXPECT_EQ(payload.right_source.table, "right_local");
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(payload, DistributedShuffleJoinTableSide::Left),
+        "SELECT id, bucket FROM `shuffle db`._shuffle_previous_stage_output");
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(payload, DistributedShuffleJoinTableSide::Right),
+        "SELECT bucket, value FROM default.right_local");
+}
+
 TEST(DistributedShuffleJoin, ParsesRemoteExchangeSystemQuery)
 {
     const auto table_names = createDistributedShuffleJoinTableNames(
@@ -1167,7 +1577,7 @@ TEST(DistributedShuffleJoin, CurrentShardExchangeExecutorFactoryValidatesInputs)
         Exception);
 }
 
-TEST(DistributedShuffleJoin, SystemQueryExchangeExecutorNeedsDistributedStorages)
+TEST(DistributedShuffleJoin, SystemQueryExchangeExecutorNeedsDistributedStoragesOrExplicitSources)
 {
     const auto table_names = createDistributedShuffleJoinTableNames(
         "default",
@@ -1178,6 +1588,19 @@ TEST(DistributedShuffleJoin, SystemQueryExchangeExecutorNeedsDistributedStorages
 
     EXPECT_THROW(exchange_executor.executeOnShard(0, table_names), Exception);
     EXPECT_TRUE(query_executor.getQueries().empty());
+
+    auto info = makeExchangeInfo();
+    info.left_source_database = "default";
+    info.left_source_table = "stage_output";
+    info.right_source_database = "default";
+    info.right_source_table = "right_local";
+    info.cluster_name = "test_cluster";
+
+    SystemQueryDistributedShuffleJoinExchangeExecutor explicit_source_exchange_executor(query_executor, info);
+    explicit_source_exchange_executor.executeOnShard(0, table_names);
+
+    ASSERT_EQ(query_executor.getQueries().size(), 1);
+    EXPECT_TRUE(query_executor.getQueries()[0].query.starts_with("SYSTEM DISTRIBUTED SHUFFLE JOIN EXCHANGE "));
 }
 
 TEST(DistributedShuffleJoin, CreatesMemoryTableNamesAndQueries)
@@ -1193,8 +1616,14 @@ TEST(DistributedShuffleJoin, CreatesMemoryTableNamesAndQueries)
         createDistributedShuffleJoinMemoryTableQuery(table_names, DistributedShuffleJoinTableSide::Left, *makeHeader()),
         "CREATE TABLE IF NOT EXISTS default._shuffle_query_with_dashes_7_left (id UInt64) ENGINE = Memory");
     EXPECT_EQ(
+        createDistributedShuffleJoinMemoryTableQuery("default._shuffle_query_with_dashes_7_output", *makeHeader()),
+        "CREATE TABLE IF NOT EXISTS default._shuffle_query_with_dashes_7_output (id UInt64) ENGINE = Memory");
+    EXPECT_EQ(
         dropDistributedShuffleJoinTableQuery(table_names, DistributedShuffleJoinTableSide::Right),
         "DROP TABLE IF EXISTS default._shuffle_query_with_dashes_7_right");
+    EXPECT_EQ(
+        dropDistributedShuffleJoinTableQuery("default._shuffle_query_with_dashes_7_output"),
+        "DROP TABLE IF EXISTS default._shuffle_query_with_dashes_7_output");
 }
 
 TEST(DistributedShuffleJoin, EncodesAndParsesMemoryTableExpiration)
@@ -1209,6 +1638,7 @@ TEST(DistributedShuffleJoin, EncodesAndParsesMemoryTableExpiration)
     EXPECT_EQ(table_names.right_table, "_shuffle_expiring_query_2_expires_123456_right");
     EXPECT_EQ(tryGetDistributedShuffleJoinTableExpirationTimeMs(table_names.left_table), 123456);
     EXPECT_EQ(tryGetDistributedShuffleJoinTableExpirationTimeMs(table_names.right_table), 123456);
+    EXPECT_EQ(tryGetDistributedShuffleJoinTableExpirationTimeMs("_shuffle_expiring_query_2_expires_123456_output"), 123456);
     EXPECT_FALSE(tryGetDistributedShuffleJoinTableExpirationTimeMs("_shuffle_expiring_query_2_left").has_value());
     EXPECT_FALSE(tryGetDistributedShuffleJoinTableExpirationTimeMs("_shuffle_expiring_query_2_expires_invalid_left").has_value());
 }

@@ -57,8 +57,14 @@ String createDistributedShuffleJoinMemoryTableQuery(
     DistributedShuffleJoinTableSide side,
     const Block & header);
 
+String createDistributedShuffleJoinMemoryTableQuery(
+    String qualified_table_name,
+    const Block & header);
+
 String dropDistributedShuffleJoinTableQuery(
     const DistributedShuffleJoinTableNames & table_names,
     DistributedShuffleJoinTableSide side);
+
+String dropDistributedShuffleJoinTableQuery(String qualified_table_name);
 
 }

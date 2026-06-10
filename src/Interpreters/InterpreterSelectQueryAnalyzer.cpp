@@ -351,6 +351,15 @@ BlockIO InterpreterSelectQueryAnalyzer::execute()
 {
     if (context->getSettingsRef()[Setting::distributed_shuffle_join] && select_query_options.to_stage == QueryProcessingStage::Complete)
     {
+        if (auto shuffle_join_info = tryAnalyzeDistributedShuffleJoinLeftDeep(query_tree, context))
+        {
+            auto result = executeDistributedShuffleJoinLeftDeepPipeline(*shuffle_join_info, context, 0);
+            if (!select_query_options.ignore_quota)
+                result.pipeline.setQuota(context->getQuota());
+
+            return result;
+        }
+
         if (auto shuffle_join_info = tryAnalyzeDistributedShuffleJoin(query_tree, context))
         {
             auto result = executeDistributedShuffleJoinPipeline(*shuffle_join_info, context, 0);

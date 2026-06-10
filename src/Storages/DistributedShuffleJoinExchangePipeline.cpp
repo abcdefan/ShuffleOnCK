@@ -48,6 +48,7 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <sstream>
@@ -114,6 +115,27 @@ const StorageDistributed * getSourceStorage(
     return storage;
 }
 
+DistributedShuffleJoinExchangeSource getExchangeSource(
+    const DistributedShuffleJoinInfo & info,
+    DistributedShuffleJoinTableSide side)
+{
+    const auto & database = side == DistributedShuffleJoinTableSide::Left
+        ? info.left_source_database
+        : info.right_source_database;
+    const auto & table = side == DistributedShuffleJoinTableSide::Left
+        ? info.left_source_table
+        : info.right_source_table;
+
+    if (!database.empty() && !table.empty())
+        return DistributedShuffleJoinExchangeSource{.database = database, .table = table};
+
+    const auto * storage = getSourceStorage(info, side);
+    return DistributedShuffleJoinExchangeSource{
+        .database = storage->getRemoteDatabaseName(),
+        .table = storage->getRemoteTableName(),
+    };
+}
+
 const DistributedShuffleJoinExchangeSource & getPayloadSource(
     const DistributedShuffleJoinExchangePayload & payload,
     DistributedShuffleJoinTableSide side)
@@ -145,6 +167,17 @@ String formatColumnList(const NamesAndTypes & columns)
     }
 
     return result;
+}
+
+String getQualifiedTableName(String database, String table)
+{
+    if (database.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` table database cannot be empty");
+
+    if (table.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` table name cannot be empty");
+
+    return backQuoteIfNeed(database) + "." + backQuoteIfNeed(table);
 }
 
 String formatLocalJoinProjectionList(const DistributedShuffleJoinInfo & info)
@@ -471,6 +504,7 @@ UInt64 getShuffleJoinExpirationTimeMilliseconds(ContextPtr context)
 
 void cleanupExpiredDistributedShuffleJoinTables(
     const DistributedShuffleJoinTableNames & current_table_names,
+    const std::vector<String> & protected_table_names,
     ContextPtr context)
 {
     auto database = DatabaseCatalog::instance().tryGetDatabase(current_table_names.database);
@@ -478,6 +512,14 @@ void cleanupExpiredDistributedShuffleJoinTables(
         return;
 
     const auto now_ms = getCurrentTimeMilliseconds();
+    const auto is_protected_table = [&](const String & table_name)
+    {
+        if (table_name == current_table_names.left_table || table_name == current_table_names.right_table)
+            return true;
+
+        return std::find(protected_table_names.begin(), protected_table_names.end(), table_name) != protected_table_names.end();
+    };
+
     std::vector<String> expired_table_names;
     {
         auto tables = database->getTablesIterator(
@@ -494,7 +536,7 @@ void cleanupExpiredDistributedShuffleJoinTables(
             if (!storage || storage->getName() != "Memory")
                 continue;
 
-            if (table_name == current_table_names.left_table || table_name == current_table_names.right_table)
+            if (is_protected_table(table_name))
                 continue;
 
             const auto expiration_time_ms = tryGetDistributedShuffleJoinTableExpirationTimeMs(table_name);
@@ -592,6 +634,38 @@ struct DistributedShuffleJoinExecutionLifetime
     std::unique_ptr<IDistributedShuffleJoinQueryExecutor> query_executor;
     std::unique_ptr<DistributedShuffleJoinCoordinator> coordinator;
 };
+
+void executeDistributedShuffleJoinQueryForAllShards(
+    size_t shard_count,
+    const String & query,
+    IDistributedShuffleJoinQueryExecutor & query_executor)
+{
+    if (shard_count == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` query cannot run without shards");
+
+    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
+        query_executor.executeOnShard(shard_index, query);
+}
+
+void cleanupDistributedShuffleJoinQueryForAllShards(
+    size_t shard_count,
+    const String & query,
+    IDistributedShuffleJoinQueryExecutor & query_executor) noexcept
+{
+    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
+    {
+        try
+        {
+            query_executor.executeCleanupOnShard(shard_index, query);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(
+                __PRETTY_FUNCTION__,
+                fmt::format("Failed to execute distributed `shuffle join` cleanup query on shard {}", shard_index));
+        }
+    }
+}
 
 }
 
@@ -749,10 +823,10 @@ String createDistributedShuffleJoinExchangeSourceQuery(
     const DistributedShuffleJoinInfo & info,
     DistributedShuffleJoinTableSide side)
 {
-    const auto * storage = getSourceStorage(info, side);
+    const auto source = getExchangeSource(info, side);
     return createDistributedShuffleJoinExchangeSourceQuery(
-        storage->getRemoteDatabaseName(),
-        storage->getRemoteTableName(),
+        source.database,
+        source.table,
         info,
         side);
 }
@@ -892,23 +966,12 @@ DistributedShuffleJoinExchangePayload createDistributedShuffleJoinExchangePayloa
     const DistributedShuffleJoinTableNames & table_names,
     const DistributedShuffleJoinInfo & info)
 {
-    const auto * left_storage = getSourceStorage(info, DistributedShuffleJoinTableSide::Left);
-    const auto * right_storage = getSourceStorage(info, DistributedShuffleJoinTableSide::Right);
-
     DistributedShuffleJoinExchangePayload payload;
     payload.cluster_name = info.cluster_name;
     payload.shard_count = info.shard_count;
     payload.table_names = table_names;
-    payload.left_source = DistributedShuffleJoinExchangeSource
-    {
-        .database = left_storage->getRemoteDatabaseName(),
-        .table = left_storage->getRemoteTableName(),
-    };
-    payload.right_source = DistributedShuffleJoinExchangeSource
-    {
-        .database = right_storage->getRemoteDatabaseName(),
-        .table = right_storage->getRemoteTableName(),
-    };
+    payload.left_source = getExchangeSource(info, DistributedShuffleJoinTableSide::Left);
+    payload.right_source = getExchangeSource(info, DistributedShuffleJoinTableSide::Right);
     payload.left_key_column_name = info.left_key_column_name;
     payload.right_key_column_name = info.right_key_column_name;
     payload.left_required_columns = info.left_required_columns;
@@ -970,6 +1033,55 @@ DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
         std::move(context),
         join_id,
         info);
+}
+
+std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoinLeftDeepStagePlans(
+    const DistributedShuffleJoinLeftDeepInfo & info,
+    const String & initial_query_id,
+    size_t join_id,
+    UInt64 expiration_time_ms)
+{
+    if (info.shuffle_database.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan cannot be created without shuffle database");
+
+    if (info.stages.size() < 2)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan expects at least two stages");
+
+    std::vector<DistributedShuffleJoinLeftDeepStagePlan> stage_plans;
+    stage_plans.reserve(info.stages.size());
+
+    std::optional<String> previous_output_table;
+    for (size_t stage_index = 0; stage_index < info.stages.size(); ++stage_index)
+    {
+        auto stage_info = info.stages[stage_index].info;
+        if (previous_output_table)
+        {
+            stage_info.left_source_database = info.shuffle_database;
+            stage_info.left_source_table = *previous_output_table;
+        }
+
+        const auto stage_id = DistributedShuffleJoinExchangeId{
+            .initial_query_id = initial_query_id,
+            .join_id = join_id * 1000 + stage_index,
+            .expiration_time_ms = expiration_time_ms};
+
+        DistributedShuffleJoinLeftDeepStagePlan stage_plan;
+        stage_plan.info = std::move(stage_info);
+        stage_plan.execution_plan = createDistributedShuffleJoinExecutionPlan(info.shuffle_database, stage_id, stage_plan.info);
+
+        const bool is_final_stage = stage_index + 1 == info.stages.size();
+        if (!is_final_stage)
+        {
+            stage_plan.output_table = makeDistributedShuffleJoinTableNamePrefix(stage_id) + "_output";
+            stage_plan.qualified_output_table = getQualifiedTableName(info.shuffle_database, *stage_plan.output_table);
+            stage_plan.output_header = createDistributedShuffleJoinTableHeader(info.stages[stage_index].output_columns);
+            previous_output_table = stage_plan.output_table;
+        }
+
+        stage_plans.push_back(std::move(stage_plan));
+    }
+
+    return stage_plans;
 }
 
 std::shared_ptr<DistributedShuffleJoinSink> createDistributedShuffleJoinExchangeSink(
@@ -1129,7 +1241,10 @@ void executeDistributedShuffleJoinExchangePayload(
             cluster->getShardCount());
     }
 
-    cleanupExpiredDistributedShuffleJoinTables(exchange_payload.table_names, context);
+    cleanupExpiredDistributedShuffleJoinTables(
+        exchange_payload.table_names,
+        {exchange_payload.left_source.table, exchange_payload.right_source.table},
+        context);
 
     auto info = createDistributedShuffleJoinInfoFromExchangePayload(exchange_payload);
     auto sender = std::make_shared<ClusterDistributedShuffleJoinBlockSender>(cluster, context);
@@ -1418,6 +1533,106 @@ BlockIO executeDistributedShuffleJoinPipeline(
         std::move(cluster),
         std::move(query_executor),
         std::move(coordinator));
+}
+
+BlockIO executeDistributedShuffleJoinLeftDeepPipeline(
+    const DistributedShuffleJoinLeftDeepInfo & info,
+    ContextPtr context,
+    size_t join_id)
+{
+    if (!context)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` pipeline cannot be created without context");
+
+    if (info.stages.size() < 2)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` pipeline expects at least two stages");
+
+    const auto & first_stage = info.stages[0];
+    if (!first_stage.info.left_storage)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` pipeline cannot be created without first input storage");
+
+    auto cluster = first_stage.info.left_storage->getCluster();
+    if (!cluster)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` pipeline cannot be created without cluster");
+
+    const auto initial_query_id = getShuffleJoinInitialQueryId(context);
+    const auto expiration_time_ms = getShuffleJoinExpirationTimeMilliseconds(context);
+
+    auto query_executor = std::make_unique<ClusterDistributedShuffleJoinQueryExecutor>(cluster, context);
+    std::optional<String> previous_qualified_output_table;
+    std::vector<String> created_output_tables;
+    const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
+        info,
+        initial_query_id,
+        join_id,
+        expiration_time_ms);
+
+    const auto cleanup_output_table = [&](const String & qualified_table_name) noexcept
+    {
+        cleanupDistributedShuffleJoinQueryForAllShards(
+            info.shard_count,
+            dropDistributedShuffleJoinTableQuery(qualified_table_name),
+            *query_executor);
+    };
+
+    try
+    {
+        for (size_t stage_index = 0; stage_index < stage_plans.size(); ++stage_index)
+        {
+            const auto & stage_plan = stage_plans[stage_index];
+            const auto & plan = stage_plan.execution_plan;
+
+            SystemQueryDistributedShuffleJoinExchangeExecutor exchange_executor(*query_executor, stage_plan.info);
+            auto coordinator = prepareDistributedShuffleJoinExchange(
+                plan,
+                info.shard_count,
+                *query_executor,
+                exchange_executor);
+
+            if (previous_qualified_output_table)
+            {
+                cleanup_output_table(*previous_qualified_output_table);
+                std::erase(created_output_tables, *previous_qualified_output_table);
+                previous_qualified_output_table.reset();
+            }
+
+            const bool is_final_stage = stage_index + 1 == info.stages.size();
+            if (is_final_stage)
+            {
+                return executeDistributedShuffleJoinClusterLocalJoinPipeline(
+                    plan,
+                    std::move(context),
+                    std::move(cluster),
+                    std::move(query_executor),
+                    std::move(coordinator));
+            }
+
+            if (!stage_plan.qualified_output_table)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` non-final stage does not have output table");
+
+            created_output_tables.push_back(*stage_plan.qualified_output_table);
+            executeDistributedShuffleJoinQueryForAllShards(
+                info.shard_count,
+                createDistributedShuffleJoinMemoryTableQuery(
+                    *stage_plan.qualified_output_table,
+                    stage_plan.output_header),
+                *query_executor);
+
+            coordinator->joinShuffleTables(
+                fmt::format("INSERT INTO {} {}", *stage_plan.qualified_output_table, plan.local_join_query),
+                *query_executor);
+            coordinator->cleanupShuffleTables();
+
+            previous_qualified_output_table = stage_plan.qualified_output_table;
+        }
+    }
+    catch (...)
+    {
+        for (const auto & qualified_output_table : created_output_tables)
+            cleanup_output_table(qualified_output_table);
+        throw;
+    }
+
+    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` pipeline did not create a final stage");
 }
 
 void executeDistributedShuffleJoinLocalJoinAndCleanup(

@@ -134,7 +134,7 @@ std::optional<UInt64> tryGetDistributedShuffleJoinTableExpirationTimeMs(const St
         return {};
 
     const auto side = std::string_view(table_name).substr(expiration_end);
-    if (side != "_left" && side != "_right")
+    if (side != "_left" && side != "_right" && side != "_output")
         return {};
 
     UInt64 expiration_time_ms = 0;
@@ -189,9 +189,19 @@ String createDistributedShuffleJoinMemoryTableQuery(
     DistributedShuffleJoinTableSide side,
     const Block & header)
 {
+    return createDistributedShuffleJoinMemoryTableQuery(table_names.getQualifiedTableName(side), header);
+}
+
+String createDistributedShuffleJoinMemoryTableQuery(
+    String qualified_table_name,
+    const Block & header)
+{
+    if (qualified_table_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` Memory table name cannot be empty");
+
     return fmt::format(
         "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = Memory",
-        table_names.getQualifiedTableName(side),
+        qualified_table_name,
         formatColumnsForCreateQuery(header));
 }
 
@@ -199,7 +209,15 @@ String dropDistributedShuffleJoinTableQuery(
     const DistributedShuffleJoinTableNames & table_names,
     DistributedShuffleJoinTableSide side)
 {
-    return fmt::format("DROP TABLE IF EXISTS {}", table_names.getQualifiedTableName(side));
+    return dropDistributedShuffleJoinTableQuery(table_names.getQualifiedTableName(side));
+}
+
+String dropDistributedShuffleJoinTableQuery(String qualified_table_name)
+{
+    if (qualified_table_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` Memory table name cannot be empty");
+
+    return fmt::format("DROP TABLE IF EXISTS {}", qualified_table_name);
 }
 
 }
