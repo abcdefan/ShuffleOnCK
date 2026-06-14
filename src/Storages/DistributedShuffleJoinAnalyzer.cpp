@@ -435,6 +435,19 @@ bool collectProjectionColumns(DistributedShuffleJoinInfo & info, const QueryNode
     return true;
 }
 
+bool hasDuplicateProjectionColumnName(const NamesAndTypes & projection_columns, size_t projection_index)
+{
+    if (projection_index >= projection_columns.size())
+        return false;
+
+    size_t count = 0;
+    for (const auto & projection_column : projection_columns)
+        if (projection_column.name == projection_columns[projection_index].name)
+            ++count;
+
+    return count > 1;
+}
+
 void collectWhereConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
 {
     const auto * function_node = node->as<FunctionNode>();
@@ -936,11 +949,7 @@ bool collectOrderBy(DistributedShuffleJoinInfo & info, const QueryNode & query_n
         }
 
         String order_by_column_name;
-        if (projection_index != projection_nodes.size())
-        {
-            order_by_column_name = projection_columns[projection_index].name;
-        }
-        else
+        const auto append_hidden_order_by_column = [&]() -> bool
         {
             if (!isExpressionFromSemiAntiOutputSide(sort_node->getExpression(), info))
                 return false;
@@ -959,6 +968,18 @@ bool collectOrderBy(DistributedShuffleJoinInfo & info, const QueryNode & query_n
                 .source_column_name = {},
                 .expression = std::move(*expression),
                 .result_column_name = order_by_column_name});
+            return true;
+        };
+
+        if (projection_index != projection_nodes.size()
+            && !hasDuplicateProjectionColumnName(projection_columns, projection_index))
+        {
+            order_by_column_name = projection_columns[projection_index].name;
+        }
+        else
+        {
+            if (!append_hidden_order_by_column())
+                return false;
         }
 
         const int direction = sort_node->getSortDirection() == SortDirection::ASCENDING ? 1 : -1;
@@ -1053,7 +1074,7 @@ void collectColumnsFromNode(
     visitor.visit(node_copy);
 }
 
-void collectColumnsRequiredAfterStage(
+bool collectColumnsRequiredAfterStage(
     CollectColumnSourceToColumnsVisitor & visitor,
     const QueryNode & query_node,
     const std::vector<const JoinNode *> & joins,
@@ -1082,8 +1103,18 @@ void collectColumnsRequiredAfterStage(
     }
 
     if (query_node.hasOrderBy())
+    {
         for (const auto & order_by_node : query_node.getOrderBy().getNodes())
-            collectColumnsFromNode(visitor, order_by_node);
+        {
+            const auto * sort_node = order_by_node->as<SortNode>();
+            if (!sort_node)
+                return false;
+
+            collectColumnsFromNode(visitor, sort_node->getExpression());
+        }
+    }
+
+    return true;
 }
 
 bool hasDuplicateColumnNames(const NamesAndTypes & columns)
@@ -1209,10 +1240,17 @@ bool buildStageOutputProjection(
 
         if (isRightColumnSource(stage_info, output_column.source))
         {
+            auto source_column_name = tryGetMappedColumnName(
+                stage_info.right_column_name_mappings,
+                output_column.source,
+                output_column.source_column_name);
+            if (!source_column_name)
+                source_column_name = output_column.source_column_name;
+
             stage_info.projection_columns.push_back(DistributedShuffleJoinProjectionColumn{
                 .is_left = false,
                 .is_hidden = false,
-                .source_column_name = output_column.source_column_name,
+                .source_column_name = std::move(*source_column_name),
                 .expression = {},
                 .result_column_name = output_column.mapped_column_name});
             continue;
@@ -1459,7 +1497,9 @@ std::optional<DistributedShuffleJoinLeftDeepInfo> tryAnalyzeDistributedShuffleJo
     for (size_t stage_index = 0; stage_index < stage_infos.size(); ++stage_index)
     {
         CollectColumnSourceToColumnsVisitor visitor;
-        collectColumnsRequiredAfterStage(visitor, *query_node, joins, table_expressions, stage_index + 1);
+        if (!collectColumnsRequiredAfterStage(visitor, *query_node, joins, table_expressions, stage_index + 1))
+            return {};
+
         const auto & source_columns = visitor.getColumnSourceToColumns();
 
         for (size_t table_index = 0; table_index <= stage_index; ++table_index)

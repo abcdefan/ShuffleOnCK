@@ -1,8 +1,13 @@
 #include <Storages/DistributedShuffleJoinExchangePipeline.h>
 
+#include <Common/CurrentMetrics.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
+#include <Common/ThreadGroupSwitcher.h>
+#include <Common/ThreadPool.h>
 #include <Common/logger_useful.h>
 #include <Common/quoteString.h>
+#include <Common/setThreadName.h>
 #include <Core/Field.h>
 #include <Core/UUID.h>
 #include <Databases/IDatabase.h>
@@ -52,9 +57,15 @@
 #include <chrono>
 #include <limits>
 #include <sstream>
-#include <unordered_map>
 #include <utility>
 #include <vector>
+
+namespace CurrentMetrics
+{
+    extern const Metric StorageDistributedThreads;
+    extern const Metric StorageDistributedThreadsActive;
+    extern const Metric StorageDistributedThreadsScheduled;
+}
 
 namespace DB
 {
@@ -75,6 +86,37 @@ namespace Setting
 
 namespace
 {
+
+template <typename Callback>
+void executeShuffleJoinQueryForShardsInParallel(size_t shard_count, Callback && callback)
+{
+    if (shard_count == 0)
+        return;
+
+    if (shard_count == 1)
+    {
+        callback(0);
+        return;
+    }
+
+    ThreadPool pool(
+        CurrentMetrics::StorageDistributedThreads,
+        CurrentMetrics::StorageDistributedThreadsActive,
+        CurrentMetrics::StorageDistributedThreadsScheduled,
+        shard_count);
+    auto thread_group = CurrentThread::getGroup();
+
+    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
+    {
+        pool.scheduleOrThrowOnError([&, shard_index, thread_group]()
+        {
+            ThreadGroupSwitcher switcher(thread_group, ThreadName::DISTRIBUTED_SINK);
+            callback(shard_index);
+        });
+    }
+
+    pool.wait();
+}
 
 const NamesAndTypes & getRequiredColumns(
     const DistributedShuffleJoinInfo & info,
@@ -297,18 +339,26 @@ String formatJoinKind(JoinKind kind)
 ActionsDAG createFinalProjectionActions(const Block & header, const Names & visible_result_columns)
 {
     ActionsDAG actions;
-    std::unordered_map<String, const ActionsDAG::Node *> inputs_by_name;
+    std::vector<const ActionsDAG::Node *> inputs;
+    inputs.reserve(header.columns());
 
     for (const auto & column : header.getColumnsWithTypeAndName())
     {
         const auto * input = &actions.addInput(column);
-        inputs_by_name.emplace(column.name, input);
+        inputs.push_back(input);
     }
 
+    // Match by position after each name lookup so duplicate visible names are preserved.
+    size_t header_position = 0;
     for (const auto & column_name : visible_result_columns)
     {
-        auto it = inputs_by_name.find(column_name);
-        if (it == inputs_by_name.end())
+        while (header_position < header.columns()
+            && header.getByPosition(header_position).name != column_name)
+        {
+            ++header_position;
+        }
+
+        if (header_position == header.columns())
         {
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
@@ -316,7 +366,8 @@ ActionsDAG createFinalProjectionActions(const Block & header, const Names & visi
                 column_name);
         }
 
-        actions.getOutputs().push_back(it->second);
+        actions.getOutputs().push_back(inputs[header_position]);
+        ++header_position;
     }
 
     return actions;
@@ -643,8 +694,10 @@ void executeDistributedShuffleJoinQueryForAllShards(
     if (shard_count == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` query cannot run without shards");
 
-    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
+    executeShuffleJoinQueryForShardsInParallel(shard_count, [&](size_t shard_index)
+    {
         query_executor.executeOnShard(shard_index, query);
+    });
 }
 
 void cleanupDistributedShuffleJoinQueryForAllShards(
@@ -652,18 +705,27 @@ void cleanupDistributedShuffleJoinQueryForAllShards(
     const String & query,
     IDistributedShuffleJoinQueryExecutor & query_executor) noexcept
 {
-    for (size_t shard_index = 0; shard_index < shard_count; ++shard_index)
+    try
     {
-        try
+        executeShuffleJoinQueryForShardsInParallel(shard_count, [&](size_t shard_index)
         {
-            query_executor.executeCleanupOnShard(shard_index, query);
-        }
-        catch (...)
-        {
-            tryLogCurrentException(
-                __PRETTY_FUNCTION__,
-                fmt::format("Failed to execute distributed `shuffle join` cleanup query on shard {}", shard_index));
-        }
+            try
+            {
+                query_executor.executeCleanupOnShard(shard_index, query);
+            }
+            catch (...)
+            {
+                tryLogCurrentException(
+                    __PRETTY_FUNCTION__,
+                    fmt::format("Failed to execute distributed `shuffle join` cleanup query on shard {}", shard_index));
+            }
+        });
+    }
+    catch (...)
+    {
+        tryLogCurrentException(
+            __PRETTY_FUNCTION__,
+            "Failed to schedule distributed `shuffle join` cleanup queries");
     }
 }
 
@@ -1044,6 +1106,12 @@ std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoi
     if (info.shuffle_database.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan cannot be created without shuffle database");
 
+    if (initial_query_id.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan cannot be created without initial query id");
+
+    if (info.shard_count == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan cannot be created without shards");
+
     if (info.stages.size() < 2)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan expects at least two stages");
 
@@ -1054,6 +1122,28 @@ std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoi
     for (size_t stage_index = 0; stage_index < info.stages.size(); ++stage_index)
     {
         auto stage_info = info.stages[stage_index].info;
+        if (stage_info.shard_count != info.shard_count)
+        {
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Distributed left-deep `shuffle join` stage {} shard count {} does not match top-level shard count {}",
+                stage_index,
+                stage_info.shard_count,
+                info.shard_count);
+        }
+
+        if (!info.cluster_name.empty() && stage_info.cluster_name != info.cluster_name)
+        {
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Distributed left-deep `shuffle join` stage {} cluster {} does not match top-level cluster {}",
+                stage_index,
+                stage_info.cluster_name,
+                info.cluster_name);
+        }
+
+        stage_info.shuffle_database = info.shuffle_database;
+
         if (previous_output_table)
         {
             stage_info.left_source_database = info.shuffle_database;
@@ -1061,8 +1151,8 @@ std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoi
         }
 
         const auto stage_id = DistributedShuffleJoinExchangeId{
-            .initial_query_id = initial_query_id,
-            .join_id = join_id * 1000 + stage_index,
+            .initial_query_id = fmt::format("{}_stage_{}", initial_query_id, stage_index),
+            .join_id = join_id,
             .expiration_time_ms = expiration_time_ms};
 
         DistributedShuffleJoinLeftDeepStagePlan stage_plan;
@@ -1553,6 +1643,24 @@ BlockIO executeDistributedShuffleJoinLeftDeepPipeline(
     auto cluster = first_stage.info.left_storage->getCluster();
     if (!cluster)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` pipeline cannot be created without cluster");
+
+    if (info.cluster_name.empty() || cluster->getName() != info.cluster_name)
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Distributed left-deep `shuffle join` pipeline cluster {} does not match metadata cluster {}",
+            cluster->getName(),
+            info.cluster_name);
+    }
+
+    if (cluster->getShardCount() != info.shard_count)
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Distributed left-deep `shuffle join` pipeline shard count {} does not match cluster shard count {}",
+            info.shard_count,
+            cluster->getShardCount());
+    }
 
     const auto initial_query_id = getShuffleJoinInitialQueryId(context);
     const auto expiration_time_ms = getShuffleJoinExpirationTimeMilliseconds(context);

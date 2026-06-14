@@ -550,6 +550,33 @@ def test_left_deep_three_table_join_uses_multi_stage_shuffle(started_cluster):
         ]
         assert_no_shuffle_tables()
 
+        first_stage_local_join_failure_query = """
+            SELECT c.c_value AS c_value
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            WHERE throwIf(a.id = b.id, 'injected left-deep first local join failure') = 0
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        error = node1.query_and_get_error(first_stage_local_join_failure_query)
+
+        assert "injected left-deep first local join failure" in error
+        assert_no_shuffle_tables()
+
+        final_stage_local_join_failure_query = """
+            SELECT throwIf(c.bucket = b.bucket, 'injected left-deep final local join failure') AS must_fail
+            FROM left_deep_a_dist AS a
+            INNER ALL JOIN left_deep_b_dist AS b ON a.id = b.id
+            INNER ALL JOIN left_deep_c_dist AS c ON b.bucket = c.bucket
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+        """
+
+        error = node1.query_and_get_error(final_stage_local_join_failure_query)
+
+        assert "injected left-deep final local join failure" in error
+        assert_no_shuffle_tables()
+
         expired_stage_output_query = """
             SELECT
                 a.id AS id,
@@ -785,6 +812,86 @@ def test_left_deep_expression_key_preserves_regular_distributed_join_exception(
     assert_no_shuffle_tables()
 
 
+def test_left_deep_duplicate_projection_hidden_order_uses_shuffle_join(
+    started_cluster,
+):
+    query_id = f"shuffle_left_deep_duplicate_projection_hidden_order_{uuid.uuid4().hex}"
+    query = """
+        SELECT l.id AS value, modulo(r.id + 1, 3) AS value
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        INNER ALL JOIN left_dist AS x ON r.id = x.id
+        ORDER BY modulo(r.id + 1, 3) ASC, l.id ASC
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+            log_queries = 1, log_queries_min_type = 'QUERY_START'
+    """
+
+    assert node1.query(query, query_id=query_id).splitlines() == [
+        "2\t0",
+        "3\t1",
+        "1\t2",
+        "4\t2",
+    ]
+
+    for node in (node1, node2):
+        node.query("SYSTEM FLUSH LOGS query_log")
+        assert (
+            query_log_source_query_count(
+                node,
+                query_id,
+                "left",
+                "position(query, 'FROM default.left_local') > 0",
+            )
+            == 1
+        )
+        assert (
+            query_log_source_query_count(
+                node,
+                query_id,
+                "right",
+                "position(query, 'FROM default.left_local') > 0",
+            )
+            == 1
+        )
+        assert (
+            query_log_source_query_count(
+                node,
+                query_id,
+                "right",
+                "position(query, 'FROM default.right_local') > 0",
+            )
+            == 1
+        )
+        assert (
+            query_log_source_query_count(
+                node,
+                query_id,
+                "left",
+                "position(query, '_output') > 0",
+            )
+            == 1
+        )
+    assert_no_shuffle_tables()
+
+    ties_query = """
+        SELECT l.id AS value, modulo(r.id + 1, 3) AS value
+        FROM left_dist AS l
+        INNER ALL JOIN right_dist AS r ON l.id = r.id
+        INNER ALL JOIN left_dist AS x ON r.id = x.id
+        ORDER BY modulo(r.id + 1, 3) ASC
+        LIMIT 3 WITH TIES
+        SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+    """
+
+    assert sorted_tsv(node1.query(ties_query)) == [
+        "1\t2",
+        "2\t0",
+        "3\t1",
+        "4\t2",
+    ]
+    assert_no_shuffle_tables()
+
+
 def test_left_deep_compound_key_preserves_regular_distributed_join_exception(
     started_cluster,
 ):
@@ -936,6 +1043,7 @@ def test_left_deep_four_table_join_uses_n_stage_shuffle(started_cluster):
             "(200, 'd200_node2'), (400, 'd400_node2')"
         )
 
+        query_id = f"shuffle_left_deep4_scan_{uuid.uuid4().hex}"
         query = """
             SELECT
                 a.id AS id,
@@ -948,15 +1056,64 @@ def test_left_deep_four_table_join_uses_n_stage_shuffle(started_cluster):
             INNER ALL JOIN left_deep4_c_dist AS c ON b.bucket = c.bucket
             INNER ALL JOIN left_deep4_d_dist AS d ON c.group_id = d.group_id
             ORDER BY id
-            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1
+            SETTINGS enable_analyzer = 1, distributed_shuffle_join = 1,
+                log_queries = 1, log_queries_min_type = 'QUERY_START'
         """
 
-        assert node1.query(query).splitlines() == [
+        assert node1.query(query, query_id=query_id).splitlines() == [
             "1\ta1_node1\tb1_node2\tc10_node2\td100_node1",
             "2\ta2_node1\tb2_node2\tc20_node1\td200_node2",
             "3\ta3_node2\tb3_node1\tc30_node2\td300_node1",
             "4\ta4_node2\tb4_node1\tc40_node1\td400_node2",
         ]
+
+        for node in (node1, node2):
+            node.query("SYSTEM FLUSH LOGS query_log")
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "left",
+                    "position(query, 'FROM default.left_deep4_a_local') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "right",
+                    "position(query, 'FROM default.left_deep4_b_local') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "left",
+                    "position(query, '_output') > 0",
+                )
+                == 2
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "right",
+                    "position(query, 'FROM default.left_deep4_c_local') > 0",
+                )
+                == 1
+            )
+            assert (
+                query_log_source_query_count(
+                    node,
+                    query_id,
+                    "right",
+                    "position(query, 'FROM default.left_deep4_d_local') > 0",
+                )
+                == 1
+            )
         assert_no_shuffle_tables()
     finally:
         for node in (node1, node2):
