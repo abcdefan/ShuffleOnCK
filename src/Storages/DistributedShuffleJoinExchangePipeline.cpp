@@ -157,6 +157,26 @@ const StorageDistributed * getSourceStorage(
     return storage;
 }
 
+void validateExchangeSourceMetadata(
+    const DistributedShuffleJoinInfo & info,
+    DistributedShuffleJoinTableSide side)
+{
+    const auto & database = side == DistributedShuffleJoinTableSide::Left
+        ? info.left_source_database
+        : info.right_source_database;
+    const auto & table = side == DistributedShuffleJoinTableSide::Left
+        ? info.left_source_table
+        : info.right_source_table;
+
+    if (database.empty() != table.empty())
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Distributed `shuffle join` exchange source for {} side must have both database and table or neither",
+            toString(side));
+    }
+}
+
 DistributedShuffleJoinExchangeSource getExchangeSource(
     const DistributedShuffleJoinInfo & info,
     DistributedShuffleJoinTableSide side)
@@ -167,6 +187,8 @@ DistributedShuffleJoinExchangeSource getExchangeSource(
     const auto & table = side == DistributedShuffleJoinTableSide::Left
         ? info.left_source_table
         : info.right_source_table;
+
+    validateExchangeSourceMetadata(info, side);
 
     if (!database.empty() && !table.empty())
         return DistributedShuffleJoinExchangeSource{.database = database, .table = table};
@@ -393,6 +415,36 @@ void validateExchangeInfo(const DistributedShuffleJoinInfo & info, DistributedSh
             ErrorCodes::BAD_ARGUMENTS,
             "Distributed `shuffle join` exchange sink cannot be created without {} required columns",
             toString(side));
+}
+
+bool areColumnsEqual(const NameAndTypePair & left, const NameAndTypePair & right)
+{
+    return left.name == right.name
+        && left.type
+        && right.type
+        && left.type->equals(*right.type);
+}
+
+bool areColumnsEqual(const NamesAndTypes & left, const NamesAndTypes & right)
+{
+    if (left.size() != right.size())
+        return false;
+
+    for (size_t index = 0; index < left.size(); ++index)
+        if (!areColumnsEqual(left[index], right[index]))
+            return false;
+
+    return true;
+}
+
+Names getColumnNames(const NamesAndTypes & columns)
+{
+    Names result;
+    result.reserve(columns.size());
+    for (const auto & column : columns)
+        result.push_back(column.name);
+
+    return result;
 }
 
 Poco::JSON::Object::Ptr serializeColumns(const NamesAndTypes & columns)
@@ -1055,6 +1107,17 @@ DistributedShuffleJoinExecutionPlan createDistributedShuffleJoinExecutionPlan(
 
     validateExchangeInfo(info, DistributedShuffleJoinTableSide::Left);
     validateExchangeInfo(info, DistributedShuffleJoinTableSide::Right);
+    validateExchangeSourceMetadata(info, DistributedShuffleJoinTableSide::Left);
+    validateExchangeSourceMetadata(info, DistributedShuffleJoinTableSide::Right);
+
+    if (info.limit_offset && !info.limit_length)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` execution plan cannot have OFFSET without LIMIT");
+
+    if (info.limit_with_ties && !info.limit_length)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` execution plan cannot have LIMIT WITH TIES without LIMIT");
+
+    if (info.limit_with_ties && info.order_by.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed `shuffle join` execution plan cannot have LIMIT WITH TIES without ORDER BY");
 
     DistributedShuffleJoinExecutionPlan plan;
     plan.table_names = createDistributedShuffleJoinTableNames(std::move(shuffle_database), std::move(exchange_id));
@@ -1115,6 +1178,9 @@ std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoi
     if (info.stages.size() < 2)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan expects at least two stages");
 
+    if (info.cluster_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Distributed left-deep `shuffle join` execution plan cannot be created without cluster");
+
     std::vector<DistributedShuffleJoinLeftDeepStagePlan> stage_plans;
     stage_plans.reserve(info.stages.size());
 
@@ -1132,7 +1198,7 @@ std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoi
                 info.shard_count);
         }
 
-        if (!info.cluster_name.empty() && stage_info.cluster_name != info.cluster_name)
+        if (stage_info.cluster_name != info.cluster_name)
         {
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
@@ -1160,8 +1226,50 @@ std::vector<DistributedShuffleJoinLeftDeepStagePlan> createDistributedShuffleJoi
         stage_plan.execution_plan = createDistributedShuffleJoinExecutionPlan(info.shuffle_database, stage_id, stage_plan.info);
 
         const bool is_final_stage = stage_index + 1 == info.stages.size();
+        if (is_final_stage && !info.stages[stage_index].output_columns.empty())
+        {
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Distributed left-deep `shuffle join` final stage {} cannot have output columns",
+                stage_index);
+        }
+
         if (!is_final_stage)
         {
+            if (info.stages[stage_index].output_columns.empty())
+            {
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Distributed left-deep `shuffle join` non-final stage {} cannot be created without output columns",
+                    stage_index);
+            }
+
+            const auto & next_stage_left_columns = info.stages[stage_index + 1].info.left_required_columns;
+            if (!areColumnsEqual(info.stages[stage_index].output_columns, next_stage_left_columns))
+            {
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Distributed left-deep `shuffle join` non-final stage {} output columns do not match next stage left input columns",
+                    stage_index);
+            }
+
+            if (stage_plan.execution_plan.has_hidden_projection_columns)
+            {
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Distributed left-deep `shuffle join` non-final stage {} cannot have hidden projection columns",
+                    stage_index);
+            }
+
+            const auto output_column_names = getColumnNames(info.stages[stage_index].output_columns);
+            if (stage_plan.execution_plan.visible_result_columns != output_column_names)
+            {
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Distributed left-deep `shuffle join` non-final stage {} projection columns do not match output columns",
+                    stage_index);
+            }
+
             stage_plan.output_table = makeDistributedShuffleJoinTableNamePrefix(stage_id) + "_output";
             stage_plan.qualified_output_table = getQualifiedTableName(info.shuffle_database, *stage_plan.output_table);
             stage_plan.output_header = createDistributedShuffleJoinTableHeader(info.stages[stage_index].output_columns);

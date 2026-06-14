@@ -17,6 +17,7 @@
 #include <Core/Settings.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
+#include <Parsers/ASTFunction.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageSnapshot.h>
 
@@ -448,10 +449,20 @@ bool hasDuplicateProjectionColumnName(const NamesAndTypes & projection_columns, 
     return count > 1;
 }
 
+bool isLogicalAndFunction(const FunctionNode & function_node)
+{
+    if (function_node.getFunctionName() == "and")
+        return true;
+
+    auto ast = function_node.toAST({});
+    const auto * function_ast = ast ? ast->as<ASTFunction>() : nullptr;
+    return function_ast && function_ast->name == "and";
+}
+
 void collectWhereConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
 {
     const auto * function_node = node->as<FunctionNode>();
-    if (function_node && function_node->getFunctionName() == "and")
+    if (function_node && isLogicalAndFunction(*function_node))
     {
         for (const auto & argument : function_node->getArguments().getNodes())
             collectWhereConjuncts(argument, conjuncts);

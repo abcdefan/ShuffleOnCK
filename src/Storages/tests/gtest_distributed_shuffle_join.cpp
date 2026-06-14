@@ -395,6 +395,29 @@ DistributedShuffleJoinInfo makeExchangeInfo()
     return info;
 }
 
+DistributedShuffleJoinProjectionColumn makeProjectionColumn(
+    bool is_left,
+    String source_column_name,
+    String result_column_name,
+    bool is_hidden = false)
+{
+    return DistributedShuffleJoinProjectionColumn{
+        .is_left = is_left,
+        .is_hidden = is_hidden,
+        .source_column_name = std::move(source_column_name),
+        .expression = "",
+        .result_column_name = std::move(result_column_name)};
+}
+
+void setLeftDeepCluster(
+    DistributedShuffleJoinLeftDeepInfo & info,
+    const String & cluster_name = "distributed_shuffle_join_test")
+{
+    info.cluster_name = cluster_name;
+    for (auto & stage : info.stages)
+        stage.info.cluster_name = cluster_name;
+}
+
 }
 
 TEST(DistributedShuffleJoin, SinkPartitionsBlocksForShuffleTables)
@@ -630,6 +653,27 @@ TEST(DistributedShuffleJoin, ExchangeSourceQueryUsesExplicitSource)
     EXPECT_EQ(
         createDistributedShuffleJoinExchangeSourceQuery(info, DistributedShuffleJoinTableSide::Left),
         "SELECT id, bucket FROM `shuffle db`._shuffle_previous_stage_output");
+}
+
+TEST(DistributedShuffleJoin, ExchangeSourceQueryRejectsPartialExplicitSource)
+{
+    {
+        auto info = makeExchangeInfo();
+        info.left_source_database = "shuffle db";
+
+        EXPECT_THROW(
+            createDistributedShuffleJoinExchangeSourceQuery(info, DistributedShuffleJoinTableSide::Left),
+            Exception);
+    }
+
+    {
+        auto info = makeExchangeInfo();
+        info.right_source_table = "_shuffle_previous_stage_output";
+
+        EXPECT_THROW(
+            createDistributedShuffleJoinExchangeSourceQuery(info, DistributedShuffleJoinTableSide::Right),
+            Exception);
+    }
 }
 
 TEST(DistributedShuffleJoin, CreatesLocalJoinQuery)
@@ -967,6 +1011,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansWithIntermediateOutputSour
     };
 
     left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1030,6 +1075,8 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansPruneEarlyFilterOnlyColumn
         {"bucket", std::make_shared<DataTypeUInt64>()},
         {"filter_value", std::make_shared<DataTypeUInt64>()},
     };
+    first_stage.info.left_filter_condition = "id >= 2";
+    first_stage.info.right_filter_condition = "bucket = 20";
     first_stage.info.post_join_filter_condition = "_shuffle_left.filter_value = _shuffle_right.filter_value";
     first_stage.info.projection_columns = {
         DistributedShuffleJoinProjectionColumn{
@@ -1069,6 +1116,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansPruneEarlyFilterOnlyColumn
     };
 
     left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1090,6 +1138,12 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansPruneEarlyFilterOnlyColumn
     EXPECT_EQ(stage_plans[0].output_header.getByPosition(0).name, "id");
     EXPECT_EQ(stage_plans[0].output_header.getByPosition(1).name, "bucket");
     EXPECT_FALSE(stage_plans[0].output_header.has("filter_value"));
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(stage_plans[0].info, DistributedShuffleJoinTableSide::Left),
+        "SELECT id, filter_value FROM remote.a_local WHERE id >= 2");
+    EXPECT_EQ(
+        createDistributedShuffleJoinExchangeSourceQuery(stage_plans[0].info, DistributedShuffleJoinTableSide::Right),
+        "SELECT id, bucket, filter_value FROM remote.b_local WHERE bucket = 20");
 }
 
 TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansForNStages)
@@ -1106,6 +1160,14 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansForNStages)
     first_stage.info.left_source_table = "a_local";
     first_stage.info.right_source_database = "remote";
     first_stage.info.right_source_table = "b_local";
+    first_stage.info.right_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+    first_stage.info.projection_columns = {
+        makeProjectionColumn(/*is_left=*/true, "id", "id"),
+        makeProjectionColumn(/*is_left=*/false, "bucket", "bucket"),
+    };
     first_stage.output_columns = {
         {"id", std::make_shared<DataTypeUInt64>()},
         {"bucket", std::make_shared<DataTypeUInt64>()},
@@ -1119,6 +1181,18 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansForNStages)
     second_stage.info.left_source_table = "will_be_replaced";
     second_stage.info.right_source_database = "remote";
     second_stage.info.right_source_table = "c_local";
+    second_stage.info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"bucket", std::make_shared<DataTypeUInt64>()},
+    };
+    second_stage.info.right_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"group_id", std::make_shared<DataTypeUInt64>()},
+    };
+    second_stage.info.projection_columns = {
+        makeProjectionColumn(/*is_left=*/true, "id", "id"),
+        makeProjectionColumn(/*is_left=*/false, "group_id", "group_id"),
+    };
     second_stage.output_columns = {
         {"id", std::make_shared<DataTypeUInt64>()},
         {"group_id", std::make_shared<DataTypeUInt64>()},
@@ -1132,8 +1206,13 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansForNStages)
     third_stage.info.left_source_table = "will_be_replaced";
     third_stage.info.right_source_database = "remote";
     third_stage.info.right_source_table = "d_local";
+    third_stage.info.left_required_columns = {
+        {"id", std::make_shared<DataTypeUInt64>()},
+        {"group_id", std::make_shared<DataTypeUInt64>()},
+    };
 
     left_deep_info.stages = {std::move(first_stage), std::move(second_stage), std::move(third_stage)};
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1172,9 +1251,14 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansUseStageSpecificIdsPastOld
     {
         DistributedShuffleJoinLeftDeepStageInfo stage;
         stage.info = makeExchangeInfo();
-        stage.output_columns = {{"id", std::make_shared<DataTypeUInt64>()}};
+        if (stage_index + 1 < stage_count)
+        {
+            stage.info.projection_columns = {makeProjectionColumn(/*is_left=*/true, "id", "id")};
+            stage.output_columns = {{"id", std::make_shared<DataTypeUInt64>()}};
+        }
         left_deep_info.stages.push_back(std::move(stage));
     }
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1218,6 +1302,205 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsEmptyInitialQueryId
         Exception);
 }
 
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsEmptyShuffleDatabase)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shard_count = 2;
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {}}};
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-empty-database-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsZeroShardCount)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {}}};
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-zero-shards-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsEmptyClusterName)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {}}};
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-empty-cluster-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsSingleStage)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {}}};
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-single-stage-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsFinalOutputColumns)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    auto first_stage_info = makeExchangeInfo();
+    first_stage_info.projection_columns = {makeProjectionColumn(/*is_left=*/true, "id", "id")};
+
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = std::move(first_stage_info),
+            .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = makeExchangeInfo(),
+            .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}}};
+    setLeftDeepCluster(left_deep_info);
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-final-output-columns-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsEmptyNonFinalOutputColumns)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {}},
+        DistributedShuffleJoinLeftDeepStageInfo{.info = makeExchangeInfo(), .output_columns = {}}};
+    setLeftDeepCluster(left_deep_info);
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-empty-output-columns-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsMismatchedOutputAndNextInputColumns)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    auto second_stage_info = makeExchangeInfo();
+    second_stage_info.left_required_columns = {{"other_id", std::make_shared<DataTypeUInt64>()}};
+
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = makeExchangeInfo(),
+            .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = std::move(second_stage_info),
+            .output_columns = {}}};
+    setLeftDeepCluster(left_deep_info);
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-mismatched-output-input-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsMismatchedProjectionAndOutputColumns)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    auto first_stage_info = makeExchangeInfo();
+    first_stage_info.projection_columns = {makeProjectionColumn(/*is_left=*/true, "id", "other_id")};
+
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = std::move(first_stage_info),
+            .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = makeExchangeInfo(),
+            .output_columns = {}}};
+    setLeftDeepCluster(left_deep_info);
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-mismatched-projection-output-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
+TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsHiddenNonFinalProjectionColumns)
+{
+    DistributedShuffleJoinLeftDeepInfo left_deep_info;
+    left_deep_info.shuffle_database = "shuffle db";
+    left_deep_info.shard_count = 2;
+
+    auto first_stage_info = makeExchangeInfo();
+    first_stage_info.projection_columns = {
+        makeProjectionColumn(/*is_left=*/true, "id", "id"),
+        makeProjectionColumn(/*is_left=*/true, "id", "_shuffle_order_by_0", /*is_hidden=*/true),
+    };
+
+    left_deep_info.stages = {
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = std::move(first_stage_info),
+            .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
+        DistributedShuffleJoinLeftDeepStageInfo{
+            .info = makeExchangeInfo(),
+            .output_columns = {}}};
+    setLeftDeepCluster(left_deep_info);
+
+    EXPECT_THROW(
+        createDistributedShuffleJoinLeftDeepStagePlans(
+            left_deep_info,
+            "left-deep-hidden-non-final-projection-test",
+            1,
+            /*expiration_time_ms=*/0),
+        Exception);
+}
+
 TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsMismatchedShardCount)
 {
     DistributedShuffleJoinLeftDeepInfo left_deep_info;
@@ -1233,6 +1516,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansRejectsMismatchedShardCoun
     left_deep_info.stages = {
         DistributedShuffleJoinLeftDeepStageInfo{.info = std::move(first_stage_info), .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
         DistributedShuffleJoinLeftDeepStageInfo{.info = std::move(second_stage_info), .output_columns = {}}};
+    setLeftDeepCluster(left_deep_info);
 
     EXPECT_THROW(
         createDistributedShuffleJoinLeftDeepStagePlans(
@@ -1277,6 +1561,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansNormalizeStageShuffleDatab
 
     auto first_stage_info = makeExchangeInfo();
     first_stage_info.shuffle_database = "stale db";
+    first_stage_info.projection_columns = {makeProjectionColumn(/*is_left=*/true, "id", "id")};
 
     auto second_stage_info = makeExchangeInfo();
     second_stage_info.shuffle_database = "stale db";
@@ -1284,6 +1569,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansNormalizeStageShuffleDatab
     left_deep_info.stages = {
         DistributedShuffleJoinLeftDeepStageInfo{.info = std::move(first_stage_info), .output_columns = {{"id", std::make_shared<DataTypeUInt64>()}}},
         DistributedShuffleJoinLeftDeepStageInfo{.info = std::move(second_stage_info), .output_columns = {}}};
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1310,6 +1596,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansWithExpiringOutputTables)
     first_stage.info.left_source_table = "a_local";
     first_stage.info.right_source_database = "remote";
     first_stage.info.right_source_table = "b_local";
+    first_stage.info.projection_columns = {makeProjectionColumn(/*is_left=*/true, "id", "id")};
     first_stage.output_columns = {
         {"id", std::make_shared<DataTypeUInt64>()},
     };
@@ -1324,6 +1611,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansWithExpiringOutputTables)
     second_stage.info.right_source_table = "c_local";
 
     left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1358,6 +1646,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansPreserveFinalGlobalPostPro
     first_stage.info.left_source_table = "a_local";
     first_stage.info.right_source_database = "remote";
     first_stage.info.right_source_table = "b_local";
+    first_stage.info.projection_columns = {makeProjectionColumn(/*is_left=*/true, "id", "id")};
     first_stage.output_columns = {
         {"id", std::make_shared<DataTypeUInt64>()},
     };
@@ -1389,6 +1678,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansPreserveFinalGlobalPostPro
     second_stage.info.limit_with_ties = true;
 
     left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1429,6 +1719,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansWithDuplicateVisibleNamesA
     first_stage.info.left_source_table = "a_local";
     first_stage.info.right_source_database = "remote";
     first_stage.info.right_source_table = "b_local";
+    first_stage.info.projection_columns = {makeProjectionColumn(/*is_left=*/true, "id", "id")};
     first_stage.output_columns = {
         {"id", std::make_shared<DataTypeUInt64>()},
     };
@@ -1466,6 +1757,7 @@ TEST(DistributedShuffleJoin, CreatesLeftDeepStagePlansWithDuplicateVisibleNamesA
     second_stage.info.limit_with_ties = true;
 
     left_deep_info.stages = {std::move(first_stage), std::move(second_stage)};
+    setLeftDeepCluster(left_deep_info);
 
     const auto stage_plans = createDistributedShuffleJoinLeftDeepStagePlans(
         left_deep_info,
@@ -1539,6 +1831,74 @@ TEST(DistributedShuffleJoin, ExecutionPlanCarriesLimitWithTies)
     EXPECT_TRUE(plan.limit_with_ties);
     ASSERT_EQ(plan.order_by.size(), 1);
     EXPECT_EQ(plan.order_by[0].column_name, "_shuffle_order_by_0");
+}
+
+TEST(DistributedShuffleJoin, ExecutionPlanRejectsInvalidLimitMetadata)
+{
+    {
+        auto info = makeExchangeInfo();
+        info.limit_offset = 1;
+
+        EXPECT_THROW(
+            createDistributedShuffleJoinExecutionPlan(
+                "default",
+                DistributedShuffleJoinExchangeId{.initial_query_id = "invalid-offset-plan-test", .join_id = 0},
+                info),
+            Exception);
+    }
+
+    {
+        auto info = makeExchangeInfo();
+        info.order_by.emplace_back("id", 1, 1);
+        info.limit_with_ties = true;
+
+        EXPECT_THROW(
+            createDistributedShuffleJoinExecutionPlan(
+                "default",
+                DistributedShuffleJoinExchangeId{.initial_query_id = "invalid-ties-without-limit-plan-test", .join_id = 0},
+                info),
+            Exception);
+    }
+
+    {
+        auto info = makeExchangeInfo();
+        info.limit_length = 1;
+        info.limit_with_ties = true;
+
+        EXPECT_THROW(
+            createDistributedShuffleJoinExecutionPlan(
+                "default",
+                DistributedShuffleJoinExchangeId{.initial_query_id = "invalid-ties-without-order-plan-test", .join_id = 0},
+                info),
+            Exception);
+    }
+}
+
+TEST(DistributedShuffleJoin, ExecutionPlanRejectsPartialExplicitSource)
+{
+    {
+        auto info = makeExchangeInfo();
+        info.left_source_database = "shuffle db";
+
+        EXPECT_THROW(
+            createDistributedShuffleJoinExecutionPlan(
+                "default",
+                DistributedShuffleJoinExchangeId{.initial_query_id = "partial-left-source-plan-test", .join_id = 0},
+                info),
+            Exception);
+    }
+
+    {
+        auto info = makeExchangeInfo();
+        info.right_source_table = "_shuffle_previous_stage_output";
+
+        EXPECT_THROW(
+            createDistributedShuffleJoinExecutionPlan(
+                "default",
+                DistributedShuffleJoinExchangeId{.initial_query_id = "partial-right-source-plan-test", .join_id = 0},
+                info),
+            Exception);
+    }
 }
 
 TEST(DistributedShuffleJoin, ExecutionPlanCarriesGlobalOrderBy)

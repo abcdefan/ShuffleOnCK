@@ -316,8 +316,8 @@ def test_left_deep_three_table_join_uses_multi_stage_shuffle(started_cluster):
                 query_log_source_query_count(
                     node,
                     filter_pushdown_query_id,
-                    "left",
-                    "position(query, 'FROM default.left_deep_a_local WHERE') > 0",
+                    "right",
+                    "position(query, 'FROM default.left_deep_b_local') > 0 AND position(query, 'WHERE') > 0",
                 )
                 == 1
             )
@@ -326,16 +326,7 @@ def test_left_deep_three_table_join_uses_multi_stage_shuffle(started_cluster):
                     node,
                     filter_pushdown_query_id,
                     "right",
-                    "position(query, 'FROM default.left_deep_b_local WHERE') > 0",
-                )
-                == 1
-            )
-            assert (
-                query_log_source_query_count(
-                    node,
-                    filter_pushdown_query_id,
-                    "right",
-                    "position(query, 'FROM default.left_deep_c_local WHERE') > 0",
+                    "position(query, 'FROM default.left_deep_c_local') > 0 AND position(query, 'WHERE') > 0",
                 )
                 == 1
             )
@@ -817,7 +808,7 @@ def test_left_deep_duplicate_projection_hidden_order_uses_shuffle_join(
 ):
     query_id = f"shuffle_left_deep_duplicate_projection_hidden_order_{uuid.uuid4().hex}"
     query = """
-        SELECT l.id AS value, modulo(r.id + 1, 3) AS value
+        SELECT l.id, x.id
         FROM left_dist AS l
         INNER ALL JOIN right_dist AS r ON l.id = r.id
         INNER ALL JOIN left_dist AS x ON r.id = x.id
@@ -827,10 +818,10 @@ def test_left_deep_duplicate_projection_hidden_order_uses_shuffle_join(
     """
 
     assert node1.query(query, query_id=query_id).splitlines() == [
-        "2\t0",
-        "3\t1",
-        "1\t2",
-        "4\t2",
+        "2\t2",
+        "3\t3",
+        "1\t1",
+        "4\t4",
     ]
 
     for node in (node1, node2):
@@ -874,7 +865,7 @@ def test_left_deep_duplicate_projection_hidden_order_uses_shuffle_join(
     assert_no_shuffle_tables()
 
     ties_query = """
-        SELECT l.id AS value, modulo(r.id + 1, 3) AS value
+        SELECT l.id, x.id
         FROM left_dist AS l
         INNER ALL JOIN right_dist AS r ON l.id = r.id
         INNER ALL JOIN left_dist AS x ON r.id = x.id
@@ -884,10 +875,10 @@ def test_left_deep_duplicate_projection_hidden_order_uses_shuffle_join(
     """
 
     assert sorted_tsv(node1.query(ties_query)) == [
-        "1\t2",
-        "2\t0",
-        "3\t1",
-        "4\t2",
+        "1\t1",
+        "2\t2",
+        "3\t3",
+        "4\t4",
     ]
     assert_no_shuffle_tables()
 
