@@ -9,6 +9,7 @@
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Interpreters/Context.h>
 #include <Storages/AlterCommands.h>
+#include <Storages/DistributedShuffleJoinTables.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageMemory.h>
 #include <Storages/MemorySettings.h>
@@ -41,12 +42,16 @@
 #include <Common/FailPoint.h>
 #include <Common/FileChecker.h>
 
+#include <map>
+#include <string_view>
+
 
 namespace DB
 {
 namespace Setting
 {
     extern const SettingsUInt64 max_compress_block_size;
+    extern const SettingsUInt64 distributed_shuffle_join_max_bytes_per_shard;
 }
 
 namespace MemorySetting
@@ -64,11 +69,153 @@ namespace ErrorCodes
     extern const int CANNOT_RESTORE_TABLE;
     extern const int NOT_IMPLEMENTED;
     extern const int BACKUP_ENTRY_NOT_FOUND;
+    extern const int TOO_MANY_BYTES;
 }
 
 namespace FailPoints
 {
     extern const char backup_add_empty_memory_table[];
+}
+
+namespace
+{
+
+std::mutex distributed_shuffle_join_memory_limit_mutex;
+using DistributedShuffleJoinTablePairKey = std::pair<String, String>;
+std::map<DistributedShuffleJoinTablePairKey, UInt64> distributed_shuffle_join_reserved_bytes;
+
+struct DistributedShuffleJoinMemoryLimit
+{
+    DistributedShuffleJoinTablePairKey table_pair_key;
+    StoragePtr counterpart_table;
+    UInt64 max_bytes;
+};
+
+std::optional<DistributedShuffleJoinTableSide> tryGetDistributedShuffleJoinTableSide(const String & table_name)
+{
+    if (!table_name.starts_with("_shuffle_"))
+        return {};
+
+    if (table_name.ends_with("_left"))
+        return DistributedShuffleJoinTableSide::Left;
+
+    if (table_name.ends_with("_right"))
+        return DistributedShuffleJoinTableSide::Right;
+
+    return {};
+}
+
+String getDistributedShuffleJoinCounterpartTableName(
+    const String & table_name,
+    DistributedShuffleJoinTableSide side)
+{
+    static constexpr std::string_view left_suffix = "_left";
+    static constexpr std::string_view right_suffix = "_right";
+
+    const auto suffix_size = side == DistributedShuffleJoinTableSide::Left ? left_suffix.size() : right_suffix.size();
+    auto result = table_name.substr(0, table_name.size() - suffix_size);
+    result += side == DistributedShuffleJoinTableSide::Left ? right_suffix : left_suffix;
+    return result;
+}
+
+std::optional<DistributedShuffleJoinMemoryLimit> tryGetDistributedShuffleJoinMemoryLimit(
+    StorageMemory & storage,
+    ContextPtr context)
+{
+    if (!context)
+        return {};
+
+    const UInt64 max_bytes = context->getSettingsRef()[Setting::distributed_shuffle_join_max_bytes_per_shard];
+    if (!max_bytes)
+        return {};
+
+    const auto table_id = storage.getStorageID();
+    const auto side = tryGetDistributedShuffleJoinTableSide(table_id.table_name);
+    if (!side)
+        return {};
+
+    const auto counterpart_table_name = getDistributedShuffleJoinCounterpartTableName(table_id.table_name, *side);
+    auto counterpart_table = DatabaseCatalog::instance().tryGetTable(
+        StorageID(table_id.database_name, counterpart_table_name),
+        context);
+    if (!counterpart_table || !std::dynamic_pointer_cast<StorageMemory>(counterpart_table))
+        return {};
+
+    static constexpr std::string_view left_suffix = "_left";
+    static constexpr std::string_view right_suffix = "_right";
+    const auto suffix_size = *side == DistributedShuffleJoinTableSide::Left ? left_suffix.size() : right_suffix.size();
+    auto table_pair_prefix = table_id.table_name.substr(0, table_id.table_name.size() - suffix_size);
+
+    return DistributedShuffleJoinMemoryLimit{
+        .table_pair_key = {table_id.database_name, std::move(table_pair_prefix)},
+        .counterpart_table = std::move(counterpart_table),
+        .max_bytes = max_bytes,
+    };
+}
+
+void reserveDistributedShuffleJoinMemoryTableBytes(
+    StorageMemory & storage,
+    ContextPtr context,
+    const DistributedShuffleJoinMemoryLimit & limit,
+    UInt64 incoming_block_bytes,
+    UInt64 & sink_reserved_bytes)
+{
+    std::lock_guard lock(distributed_shuffle_join_memory_limit_mutex);
+
+    const UInt64 current_table_bytes = storage.totalBytes(context).value_or(0);
+    const UInt64 counterpart_table_bytes = limit.counterpart_table->totalBytes(context).value_or(0);
+    const auto reservation_it = distributed_shuffle_join_reserved_bytes.find(limit.table_pair_key);
+    const UInt64 reserved_bytes
+        = reservation_it == distributed_shuffle_join_reserved_bytes.end() ? 0 : reservation_it->second;
+
+    UInt64 remaining_bytes = limit.max_bytes;
+    const auto consumeAvailableBytes = [&remaining_bytes](UInt64 bytes)
+    {
+        if (bytes > remaining_bytes)
+            return false;
+
+        remaining_bytes -= bytes;
+        return true;
+    };
+
+    if (!consumeAvailableBytes(current_table_bytes)
+        || !consumeAvailableBytes(counterpart_table_bytes)
+        || !consumeAvailableBytes(reserved_bytes)
+        || !consumeAvailableBytes(incoming_block_bytes))
+    {
+        throw Exception(
+            ErrorCodes::TOO_MANY_BYTES,
+            "Distributed `shuffle join` exceeded maximum `Memory` table bytes on a target shard: "
+            "current table {}, counterpart table {}, buffered inserts {}, incoming block {}, maximum {} "
+            "(`distributed_shuffle_join_max_bytes_per_shard`)",
+            current_table_bytes,
+            counterpart_table_bytes,
+            reserved_bytes,
+            incoming_block_bytes,
+            limit.max_bytes);
+    }
+
+    distributed_shuffle_join_reserved_bytes[limit.table_pair_key] = reserved_bytes + incoming_block_bytes;
+    sink_reserved_bytes += incoming_block_bytes;
+}
+
+void releaseDistributedShuffleJoinMemoryTableBytes(
+    const DistributedShuffleJoinMemoryLimit & limit,
+    UInt64 & sink_reserved_bytes)
+{
+    if (!sink_reserved_bytes)
+        return;
+
+    auto reservation_it = distributed_shuffle_join_reserved_bytes.find(limit.table_pair_key);
+    chassert(reservation_it != distributed_shuffle_join_reserved_bytes.end());
+    chassert(reservation_it->second >= sink_reserved_bytes);
+
+    reservation_it->second -= sink_reserved_bytes;
+    sink_reserved_bytes = 0;
+    if (!reservation_it->second)
+        distributed_shuffle_join_reserved_bytes.erase(reservation_it);
+}
+
 }
 
 class MemorySink : public SinkToStorage
@@ -81,7 +228,18 @@ public:
         : SinkToStorage(std::make_shared<const Block>(metadata_snapshot_->getSampleBlock()))
         , storage(storage_)
         , storage_snapshot(storage_.getStorageSnapshot(metadata_snapshot_, context))
+        , query_context(context)
+        , shuffle_join_memory_limit(tryGetDistributedShuffleJoinMemoryLimit(storage_, context))
     {
+    }
+
+    ~MemorySink() override
+    {
+        if (!shuffle_join_memory_limit || !shuffle_join_reserved_bytes)
+            return;
+
+        std::lock_guard lock(distributed_shuffle_join_memory_limit_mutex);
+        releaseDistributedShuffleJoinMemoryTableBytes(*shuffle_join_memory_limit, shuffle_join_reserved_bytes);
     }
 
     String getName() const override { return "MemorySink"; }
@@ -95,11 +253,26 @@ public:
             Block compressed_block;
             for (const auto & elem : block)
                 compressed_block.insert({elem.column->compress(/*force_compression=*/true), elem.type, elem.name});
-            new_blocks.push_back(std::move(compressed_block));
+            block = std::move(compressed_block);
         }
-        else
+
+        new_blocks.push_back(std::move(block));
+        if (shuffle_join_memory_limit)
         {
-            new_blocks.push_back(std::move(block));
+            try
+            {
+                reserveDistributedShuffleJoinMemoryTableBytes(
+                    storage,
+                    query_context,
+                    *shuffle_join_memory_limit,
+                    new_blocks.back().allocatedBytes(),
+                    shuffle_join_reserved_bytes);
+            }
+            catch (...)
+            {
+                new_blocks.pop_back();
+                throw;
+            }
         }
     }
 
@@ -114,11 +287,16 @@ public:
             inserted_rows += block.rows();
         }
 
+        std::optional<std::unique_lock<std::mutex>> shuffle_join_memory_limit_lock;
+        if (shuffle_join_memory_limit)
+            shuffle_join_memory_limit_lock.emplace(distributed_shuffle_join_memory_limit_mutex);
+
         std::lock_guard lock(storage.mutex);
 
         auto new_data = std::make_unique<Blocks>(*(storage.data.get()));
         UInt64 new_total_rows = storage.total_size_rows.load(std::memory_order_relaxed) + inserted_rows;
         UInt64 new_total_bytes = storage.total_size_bytes.load(std::memory_order_relaxed) + inserted_bytes;
+
         const auto & memory_settings = storage.getMemorySettingsRef();
         while (!new_data->empty()
                && ((memory_settings[MemorySetting::max_bytes_to_keep] && new_total_bytes > memory_settings[MemorySetting::max_bytes_to_keep])
@@ -145,12 +323,18 @@ public:
         storage.data.set(std::move(new_data));
         storage.total_size_rows.store(new_total_rows, std::memory_order_relaxed);
         storage.total_size_bytes.store(new_total_bytes, std::memory_order_relaxed);
+
+        if (shuffle_join_memory_limit)
+            releaseDistributedShuffleJoinMemoryTableBytes(*shuffle_join_memory_limit, shuffle_join_reserved_bytes);
     }
 
 private:
     Blocks new_blocks;
     StorageMemory & storage;
     StorageSnapshotPtr storage_snapshot;
+    ContextPtr query_context;
+    std::optional<DistributedShuffleJoinMemoryLimit> shuffle_join_memory_limit;
+    UInt64 shuffle_join_reserved_bytes = 0;
 };
 
 

@@ -1984,6 +1984,11 @@ Maximum lifetime in milliseconds for ordinary `Memory` tables created by the exp
 
 Each shuffle table encodes its absolute expiration time in its name. When another shuffle exchange reaches the same shard and database, it removes expired leftover tables before writing new buckets. Set this value above the longest expected shuffle query duration.
 )", EXPERIMENTAL) \
+    DECLARE(UInt64, distributed_shuffle_join_max_bytes_per_shard, 8_GiB, R"(
+Maximum total size in bytes of ordinary `Memory` tables created by the experimental distributed `shuffle join` path on a single target shard.
+
+The limit is checked before writing a block into either the left or right shuffle table. It applies to the sum of the left and right shuffle table sizes for the same query on the target shard. Set to `0` to disable this dedicated shuffle table limit.
+)", EXPERIMENTAL) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.

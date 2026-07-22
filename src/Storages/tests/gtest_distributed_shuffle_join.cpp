@@ -3,6 +3,9 @@
 #include <Storages/DistributedShuffleJoinSelector.h>
 #include <Storages/DistributedShuffleJoinSink.h>
 #include <Storages/DistributedShuffleJoinTables.h>
+#include <Storages/IStorage.h>
+#include <Storages/MemorySettings.h>
+#include <Storages/StorageMemory.h>
 
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
@@ -11,8 +14,11 @@
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Block.h>
 #include <Core/Settings.h>
+#include <Databases/DatabaseMemory.h>
+#include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/DistributedShuffleJoinCoordinator.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Databases/IDatabase.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterSystemQuery.h>
@@ -20,7 +26,10 @@
 #include <Parsers/ParserSystemQuery.h>
 #include <Parsers/parseQuery.h>
 #include <Processors/Chunk.h>
+#include <Processors/Executors/PushingPipelineExecutor.h>
 #include <QueryPipeline/QueryPipeline.h>
+
+#include <base/scope_guard.h>
 
 #include <Poco/AutoPtr.h>
 #include <Poco/Util/MapConfiguration.h>
@@ -64,6 +73,26 @@ Block makeBlock(const std::vector<UInt64> & ids)
 SharedHeader makeHeader()
 {
     return std::make_shared<const Block>(makeBlock({}).cloneEmpty());
+}
+
+StoragePtr createMemoryTable(String database, String table)
+{
+    NamesAndTypesList columns;
+    columns.emplace_back("id", std::make_shared<DataTypeUInt64>());
+    return std::make_shared<StorageMemory>(
+        StorageID(std::move(database), std::move(table)),
+        ColumnsDescription{columns},
+        ConstraintsDescription{},
+        String{},
+        MemorySettings{});
+}
+
+void writeBlockToTable(const StoragePtr & table, ContextPtr context, Block block)
+{
+    QueryPipeline pipeline(table->write({}, table->getInMemoryMetadataPtr(), context, /*async_insert=*/false));
+    PushingPipelineExecutor executor(pipeline);
+    executor.push(std::move(block));
+    executor.finish();
 }
 
 Chunk makeChunk(const std::vector<UInt64> & ids)
@@ -2247,6 +2276,63 @@ TEST(DistributedShuffleJoin, CreatesMemoryTableNamesAndQueries)
     EXPECT_EQ(
         dropDistributedShuffleJoinTableQuery("default._shuffle_query_with_dashes_7_output"),
         "DROP TABLE IF EXISTS default._shuffle_query_with_dashes_7_output");
+}
+
+TEST(DistributedShuffleJoin, MemoryTableBytesLimitAppliesToLeftAndRightTablesTogether)
+{
+    auto context = Context::createCopy(getContext().context);
+    context->makeQueryContext();
+    context->setCurrentQueryId("distributed-shuffle-join-memory-limit-test");
+
+    const DistributedShuffleJoinExchangeId exchange_id{.initial_query_id = "memory-limit-test", .join_id = 0};
+    const auto table_names = createDistributedShuffleJoinTableNames("test_distributed_shuffle_join_memory_limit", exchange_id);
+    auto database = std::make_shared<DatabaseMemory>(table_names.database, context);
+    auto left_storage = createMemoryTable(table_names.database, table_names.left_table);
+    auto right_storage = createMemoryTable(table_names.database, table_names.right_table);
+
+    if (DatabaseCatalog::instance().isDatabaseExist(table_names.database))
+        DatabaseCatalog::instance().detachDatabase(context, table_names.database, /*drop=*/false, /*check_empty=*/false);
+
+    database->attachTable(context, table_names.left_table, left_storage, {});
+    database->attachTable(context, table_names.right_table, right_storage, {});
+    DatabaseCatalog::instance().attachDatabase(table_names.database, database);
+    SCOPE_EXIT({
+        try
+        {
+            DatabaseCatalog::instance().detachDatabase(context, table_names.database, /*drop=*/false, /*check_empty=*/false);
+        }
+        catch (...)
+        {
+        }
+    });
+
+    context->setSetting("distributed_shuffle_join_max_bytes_per_shard", Field(UInt64(0)));
+    writeBlockToTable(left_storage, context, makeBlock({1}));
+
+    const auto left_bytes = left_storage->totalBytes(context);
+    ASSERT_TRUE(left_bytes.has_value());
+    ASSERT_GT(*left_bytes, 0);
+
+    auto first_right_block = makeBlock({2});
+    const auto first_right_block_bytes = first_right_block.allocatedBytes();
+    ASSERT_GT(first_right_block_bytes, 0);
+    context->setSetting(
+        "distributed_shuffle_join_max_bytes_per_shard",
+        Field(*left_bytes + first_right_block_bytes));
+
+    QueryPipeline right_pipeline(right_storage->write(
+        {},
+        right_storage->getInMemoryMetadataPtr(),
+        context,
+        /*async_insert=*/false));
+    PushingPipelineExecutor right_executor(right_pipeline);
+    right_executor.push(std::move(first_right_block));
+    EXPECT_THROW(right_executor.push(makeBlock({3})), Exception);
+    right_executor.cancel();
+
+    const auto right_rows = right_storage->totalRows(context);
+    ASSERT_TRUE(right_rows.has_value());
+    EXPECT_EQ(*right_rows, 0);
 }
 
 TEST(DistributedShuffleJoin, EncodesAndParsesMemoryTableExpiration)
